@@ -1,4 +1,4 @@
-requirementsFlask==3.0.0
+Flask==3.0.0
 Werkzeug==3.0.1
 pypdf==4.0.1
 pandas==2.1.4
