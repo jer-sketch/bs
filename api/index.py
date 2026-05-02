@@ -11,44 +11,62 @@ app = Flask(__name__)
 
 def classify(full_text, is_credit):
     u = full_text.upper()
-    # PENTING: Hanya mengacu pada kata "PENERIMAAN NEGARA"
-    if 'PENERIMAAN NEGARA' in u: return 'PENERIMAAN NEGARA', ''
     
+    # 1. Prioritas: Penerimaan Negara
+    if 'PENERIMAAN NEGARA' in u: 
+        return 'PENERIMAAN NEGARA', ''
+    
+    # 2. Bunga dan Pajak (Sesuai Permintaan: 28 dan 29)
+    if 'PAJAK BUNGA' in u or 'PAJAK JASA' in u: 
+        return 'PAJAK JASA GIRO', '29'
+    if 'BUNGA' in u: 
+        return 'BUNGA', '28'
+        
+    # 3. Biaya-biaya lain
     if 'BIAYA ADM' in u: return 'BIAYA ADM BANK', '27'
-    if 'PAJAK BUNGA' in u or 'PAJAK JASA' in u: return 'PAJAK JASA GIRO', ''
-    if 'BUNGA' in u and not ('PAJAK' in u): return 'BUNGA', ''
     if 'TRANSFER' in u and 'BIAYA' in u: return 'BIAYA TRANSFER', '27'
     if 'TELKOM' in u or 'TELEPON' in u: return 'BIAYA TELEPON', '27'
     if 'LISTRIK' in u or 'PLN' in u: return 'BIAYA LISTRIK', '27'
     if 'GAJI' in u: return 'BIAYA GAJI PEGAWAI', ''
     if 'SETORAN TUNAI' in u: return 'SETORAN TUNAI', '1'
     
-    if not is_credit: return 'PELUNASAN HUTANG DAGANG', ''
+    # 4. Default berdasarkan arus kas
+    if not is_credit: 
+        return 'PELUNASAN HUTANG DAGANG', ''
+    
     return 'PENERIMAAN PENJUALAN', '3' 
 
 def extract_nama_after_nominal(sub_lines, amount):
     """
-    Mencari baris yang mengandung angka nominal, 
-    lalu mengambil baris-baris setelahnya sebagai nama.
+    Mencari baris nominal, mengambil baris setelahnya, 
+    lalu menghapus semua angka agar hanya tersisa TEXT saja.
     """
-    amt_str = "{:,.2f}".format(amount).replace(',', '') # Format: 41800.00
-    amt_comma = "{:,.2f}".format(amount) # Format: 41,800.00
+    amt_str = "{:,.2f}".format(amount).replace(',', '') 
+    amt_comma = "{:,.2f}".format(amount) 
     
     found_idx = -1
     for i, line in enumerate(sub_lines):
-        # Cek apakah baris ini mengandung nominal transaksi
         clean_line = line.replace(',', '')
         if amt_str in clean_line or amt_comma in line:
             found_idx = i
             break
     
     if found_idx != -1 and found_idx < len(sub_lines) - 1:
-        # Ambil semua teks setelah baris nominal
+        # Ambil baris-baris setelah nominal
         nama_parts = sub_lines[found_idx+1:]
-        # Bersihkan dari kata-kata sampah bank jika masih terbawa
-        nama_res = " ".join(nama_parts).strip()
-        nama_res = re.sub(r'\b(TRSF|E-BANKING|DB|CR|BIF|SWITCHING)\b', '', nama_res, flags=re.IGNORECASE)
-        return nama_res.strip(' -:').upper()
+        text_raw = " ".join(nama_parts).upper()
+        
+        # Bersihkan kata kunci perbankan
+        text_raw = re.sub(r'\b(TRSF|E-BANKING|DB|CR|BIF|SWITCHING|WS)\b', '', text_raw, flags=re.IGNORECASE)
+        
+        # HAPUS SEMUA ANGKA (Agar hanya teks saja yang tersisa)
+        text_only = re.sub(r'\d+', '', text_raw)
+        
+        # Bersihkan simbol sisa (titik, koma, garing, spasi ganda)
+        text_only = re.sub(r'[./-]', '', text_only)
+        text_only = re.sub(r'\s+', ' ', text_only)
+        
+        return text_only.strip()
     
     return ""
 
@@ -61,24 +79,18 @@ def parse_bca_pdf_logic(pdf_stream):
                 all_lines.extend(text.split('\n'))
 
     period = ''
-    saldo_awal = saldo_akhir = mut_cr = mut_db = 0
+    saldo_awal = 0
     
-    # Ambil Metadata
+    # Ambil Metadata Header
     for l in all_lines:
         if 'PERIODE :' in l and not period:
             period = l.split(':', 1)[1].strip()
         m = re.search(r'SALDO AWAL\s*:\s*([\d,]+\.\d+)', l)
         if m: saldo_awal = float(m.group(1).replace(',',''))
-        m = re.search(r'MUTASI CR\s*:\s*([\d,]+\.\d+)', l)
-        if m: mut_cr = float(m.group(1).replace(',',''))
-        m = re.search(r'MUTASI DB\s*:\s*([\d,]+\.\d+)', l)
-        if m: mut_db = float(m.group(1).replace(',',''))
-        m = re.search(r'SALDO AKHIR\s*:\s*([\d,]+\.\d+)', l)
-        if m: saldo_akhir = float(m.group(1).replace(',',''))
 
     year = period.strip().split()[-1] if period else str(datetime.now().year)
 
-    # Identifikasi baris transaksi
+    # Kelompokkan baris berdasarkan Tanggal (Blok Transaksi)
     DATE_RE = re.compile(r'^(\d{2})/(\d{2})\s+')
     tx_blocks = []
     current_block = []
@@ -96,41 +108,43 @@ def parse_bca_pdf_logic(pdf_stream):
 
     txs = []
     for block in tx_blocks:
-        # 1. Skip jika ini baris Saldo Awal di dalam mutasi
         full_block_text = " ".join(block).upper()
-        if 'SALDO AWAL' in full_block_text:
+        
+        # FILTER: Jangan masukkan baris saldo awal mutasi ke dalam daftar transaksi
+        if 'SALDO AWAL' in full_block_text and len(block) < 3:
             continue
 
-        first_line = block[0]
-        m = DATE_RE.match(first_line)
-        day, mon = m.group(1), m.group(2)
-        date_str = f"{day}/{mon}/{year}"
+        m = DATE_RE.match(block[0])
+        date_str = f"{m.group(1)}/{m.group(2)}/{year}"
 
-        # Cari nominal di blok ini
-        # Kita cari angka dengan format desimal .00
-        amounts_found = re.findall(r'([\d,]+\.\d{2})', " ".join(block))
+        # Cari nominal transaksi (format 00.00)
+        amounts_found = re.findall(r'([\d,]+\.\d{2})', full_block_text)
         if not amounts_found:
             continue
         
         amt = float(amounts_found[0].replace(',', ''))
         
         # Tentukan Debet/Kredit
-        is_cr = (' CR' in full_block_text or 'SETORAN TUNAI' in full_block_text or 'KR OTOMATIS' in full_block_text)
-        is_db = (' DB' in full_block_text or 'BYR VIA' in full_block_text or 'BIAYA ADM' in full_block_text)
+        is_cr = (' CR' in full_block_text or 'SETORAN TUNAI' in full_block_text or 'KR OTOMATIS' in full_block_text or 'BUNGA' in full_block_text)
+        is_db = (' DB' in full_block_text or 'BYR VIA' in full_block_text or 'BIAYA ADM' in full_block_text or 'PAJAK' in full_block_text)
         
-        # Klasifikasi
+        # Jika bunganya kredit tapi pajaknya debet
+        if 'PAJAK' in full_block_text: is_db, is_cr = True, False
+        if 'BUNGA' in full_block_text and 'PAJAK' not in full_block_text: is_db, is_cr = False, True
+
+        # Klasifikasi kategori dan kode
         ket, kode = classify(full_block_text, is_cr and not is_db)
         
-        # Ekstraksi Nama: Cari baris setelah baris yang berisi nominal
+        # Ekstraksi Nama (Hanya teks setelah nominal)
         nama_orang = extract_nama_after_nominal(block, amt)
         
-        # Jika Penerimaan Negara, kolom nama dikosongkan agar rapi
-        if ket == 'PENERIMAAN NEGARA':
+        # Bersihkan kolom nama jika itu pajak/bunga/adm agar Excel rapi
+        if kode in ['27', '28', '29'] or ket == 'PENERIMAAN NEGARA':
             nama_orang = ''
 
         debet = amt if is_db else 0
         kredit = amt if (is_cr and not is_db) else 0
-        if debet == 0 and kredit == 0: kredit = amt # Default jika tidak terdeteksi DB/CR
+        if debet == 0 and kredit == 0: kredit = amt 
 
         txs.append({
             'date': date_str,
@@ -141,10 +155,7 @@ def parse_bca_pdf_logic(pdf_stream):
             'kredit': kredit
         })
 
-    return {
-        "txs": txs, "period": period, "saldo_awal": saldo_awal, 
-        "saldo_akhir": saldo_akhir, "mut_db": mut_db, "mut_cr": mut_cr
-    }
+    return {"txs": txs, "period": period, "saldo_awal": saldo_awal}
 
 def create_excel_output(data):
     wb = openpyxl.Workbook()
@@ -152,7 +163,6 @@ def create_excel_output(data):
     ws.title = 'Mutasi BCA'
     
     num_fmt = '#,##0.00'
-    
     ws.append(['BCA 346-8383111'])
     ws.append(['CV. MITRA JAYA ANUGERAH'])
     ws.append([f"PERIODE: {data['period']}"])
@@ -160,6 +170,13 @@ def create_excel_output(data):
     
     headers = ['NO', 'TANGGAL', 'NAMA', 'KETERANGAN', 'KODE', 'DEBET', 'KREDIT', 'SALDO']
     ws.append(headers)
+    
+    # Styling Header
+    for col in range(1, 9):
+        cell = ws.cell(row=5, column=col)
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill(start_color="0056b3", end_color="0056b3", fill_type="solid")
+        cell.alignment = Alignment(horizontal='center')
     
     # Baris Saldo Awal
     ws.append(['', '', '', 'SALDO AWAL', '', '', '', data['saldo_awal']])
@@ -179,11 +196,8 @@ def create_excel_output(data):
             current_saldo
         ])
 
-    ws.append([])
-    ws.append(['', '', '', 'TOTAL MUTASI', '', data['mut_db'], data['mut_cr'], data['saldo_akhir']])
-    
-    # Styling
-    for row in ws.iter_rows(min_row=5):
+    # Styling data
+    for row in ws.iter_rows(min_row=6):
         for cell in row:
             cell.font = Font(name='Arial', size=10)
             if cell.column in [6, 7, 8] and isinstance(cell.value, (int, float)):
@@ -201,12 +215,13 @@ def create_excel_output(data):
 @app.route('/')
 def index():
     return render_template_string("""
-    <body style="font-family:sans-serif; text-align:center; padding-top:50px; background:#f0f2f5;">
-        <div style="display:inline-block; background:white; padding:30px; border-radius:10px; shadow:0 2px 10px rgba(0,0,0,0.1)">
-            <h2>BCA Mutasi Fix (Nama & Penerimaan Negara)</h2>
+    <body style="font-family:sans-serif; text-align:center; padding-top:50px; background:#f4f7f6;">
+        <div style="display:inline-block; background:white; padding:40px; border-radius:15px; box-shadow:0 4px 15px rgba(0,0,0,0.1)">
+            <h2 style="color:#0056b3;">BCA PDF to Excel</h2>
+            <p>Pembersihan Nama (Teks Saja) & Kode Akuntansi</p>
             <form action="/convert" method="post" enctype="multipart/form-data">
-                <input type="file" name="file" accept=".pdf" required><br><br>
-                <button type="submit" style="padding:10px 20px; background:#0056b3; color:white; border:none; border-radius:5px; cursor:pointer;">Proses PDF</button>
+                <input type="file" name="file" accept=".pdf" required style="margin-bottom:20px;"><br>
+                <button type="submit" style="padding:12px 25px; background:#0056b3; color:white; border:none; border-radius:5px; cursor:pointer; font-weight:bold;">Download Excel</button>
             </form>
         </div>
     </body>
@@ -215,11 +230,11 @@ def index():
 @app.route('/convert', methods=['POST'])
 def convert():
     file = request.files['file']
-    if not file: return "File tidak ada"
+    if not file: return "Error: File tidak ditemukan"
     pdf_stream = io.BytesIO(file.read())
     data = parse_bca_pdf_logic(pdf_stream)
     excel_file = create_excel_output(data)
-    return send_file(excel_file, as_attachment=True, download_name="Mutasi_BCA_Updated.xlsx")
+    return send_file(excel_file, as_attachment=True, download_name="Mutasi_BCA_Final.xlsx")
 
 if __name__ == '__main__':
     app.run(debug=True)
