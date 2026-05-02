@@ -25,9 +25,8 @@ def classify(full_text, is_credit):
     if not is_credit: return 'PELUNASAN HUTANG DAGANG', ''
     return 'PENERIMAAN PENJUALAN', '3' 
 
-# --- LOGIKA EKSTRAKSI NAMA (REFINED) ---
+# --- LOGIKA EKSTRAKSI NAMA (REFINED V4) ---
 def is_strictly_capital(text):
-    """Memastikan teks hanya berisi huruf kapital, angka, atau simbol (Tanpa Huruf Kecil)."""
     if any(c.islower() for c in text):
         return False
     if not any(c.isupper() for c in text):
@@ -35,10 +34,6 @@ def is_strictly_capital(text):
     return True
 
 def extract_nama_refined(block, amount):
-    """
-    Mengambil semua baris KAPITAL setelah nominal ditemukan.
-    Mengabaikan baris yang memiliki huruf kecil (pembayaran sage, dll).
-    """
     amt_str = "{:.2f}".format(amount)
     
     found_idx = -1
@@ -53,26 +48,39 @@ def extract_nama_refined(block, amount):
     candidates = block[found_idx+1:]
     name_parts = []
     
+    # Kata kunci yang menandakan akhir dari Nama (Stop Words)
+    stoppers = ['KCU', 'PERIODE', 'MATA UANG', 'IDR', 'INDONESIA', 'CATATAN', 'JL ', 'NO ', 'BANDUNG', 'RT0', 'RW0']
     garbage_keywords = ['TANGGAL', 'KETERANGAN', 'MUTASI', 'SALDO', 'HALAMAN', 'REKENING', 'CBG']
     
+    stop_processing = False
     for cand in candidates:
-        cand_clean = cand.strip()
+        if stop_processing: break
         
-        # 1. Harus Kapital Semua (Abaikan 'pembayaran sage')
-        if not is_strictly_capital(cand_clean):
-            continue
-            
-        # 2. Abaikan Header/Footer yang Kapital
-        if any(g in cand_clean.upper() for g in garbage_keywords):
-            continue
-            
-        # 3. Jika lolos, masukkan ke list (mendukung nama 2 baris)
-        name_parts.append(cand_clean)
+        cand_up = cand.strip().upper()
+        
+        # 1. Cek Stopper: Jika ada kata KCU dsb, potong barisnya dan berhenti
+        for s in stoppers:
+            if s in cand_up:
+                # Ambil teks sebelum kata stopper
+                split_text = re.split(s, cand_up, flags=re.IGNORECASE)[0]
+                if split_text.strip():
+                    name_parts.append(split_text.strip())
+                stop_processing = True
+                break
+        
+        if stop_processing: break
 
-    # Gabungkan baris-baris kapital yang ditemukan
+        # 2. Filter Kapital & Garbage (seperti logic sebelumnya)
+        if not is_strictly_capital(cand.strip()):
+            continue
+        if any(g in cand_up for g in garbage_keywords):
+            continue
+            
+        name_parts.append(cand.strip())
+
     full_raw_name = " ".join(name_parts)
     
-    # Pembersihan final kode perbankan
+    # Pembersihan kode bank
     patterns = [
         r'\bTRSF\b', r'\bWS\b', r'\bFTSCY\b', r'\bDB\b', r'\bCR\b', r'\bDR\b',
         r'\bE-BANKING\b', r'\bM-BCA\b', r'\bBIF\b', r'\bSWITCHING\b'
@@ -80,11 +88,8 @@ def extract_nama_refined(block, amount):
     for p in patterns:
         full_raw_name = re.sub(p, '', full_raw_name, flags=re.IGNORECASE)
     
-    # Hapus angka yang berdiri sendiri (kode referensi)
-    full_raw_name = re.sub(r'\b\d+\b', '', full_raw_name)
-    
-    # Bersihkan simbol sisa
-    full_raw_name = re.sub(r'[.:/]', ' ', full_raw_name)
+    full_raw_name = re.sub(r'\b\d+\b', '', full_raw_name) # Hapus angka berdiri sendiri
+    full_raw_name = re.sub(r'[.:/]', ' ', full_raw_name) # Bersihkan simbol
     
     return " ".join(full_raw_name.split()).strip().upper()
 
@@ -97,18 +102,18 @@ def parse_bca_pdf_logic(pdf_stream):
             if text:
                 for line in text.split('\n'):
                     l_up = line.upper()
-                    # Filter awal sampah halaman
                     if "BERSAMBUNG KE HALAMAN" in l_up: continue
                     if "TGL. CETAK" in l_up: continue
                     if "REKENING INI" in l_up: continue
                     all_lines.append(line.strip())
 
-    period = next((l.split(':', 1)[1].strip() for l in all_lines if 'PERIODE :' in l), "")
+    period_line = next((l for l in all_lines if 'PERIODE :' in l.upper()), "")
+    period = period_line.split(':', 1)[1].strip() if ":" in period_line else ""
     year = period.split()[-1] if period else str(datetime.now().year)
     
     saldo_awal = 0
     for l in all_lines:
-        m = re.search(r'SALDO AWAL\s*:\s*([\d,]+\.\d+)', l)
+        m = re.search(r'SALDO AWAL\s*:\s*([\d,]+\.\d+)', l.upper())
         if m: 
             saldo_awal = float(m.group(1).replace(',',''))
             break
@@ -146,8 +151,6 @@ def parse_bca_pdf_logic(pdf_stream):
         if 'BUNGA' in full_text and 'PAJAK' not in full_text: is_db, is_cr = False, True
 
         ket, kode = classify(full_text, is_cr and not is_db)
-        
-        # GUNAKAN LOGIKA REFINED DI SINI
         nama_orang = extract_nama_refined(block, amt)
 
         if kode in ['27', '28', '29'] or ket == 'PENERIMAAN NEGARA':
@@ -191,7 +194,6 @@ def create_excel_output(data):
                    tx['debet'] or '', tx['kredit'] or '', curr_saldo])
         row_idx += 1
 
-    # BARIS TOTAL MUTASI
     ws.append(['', '', '', 'TOTAL MUTASI', '', data['total_db'], data['total_cr'], curr_saldo])
     for c in range(4, 9):
         ws.cell(row_idx, c).font = Font(bold=True)
@@ -212,7 +214,7 @@ def index():
     return render_template_string("""
     <body style="font-family:sans-serif; text-align:center; padding-top:50px; background:#f4f7f6;">
         <div style="display:inline-block; background:white; padding:40px; border-radius:15px; box-shadow:0 4px 15px rgba(0,0,0,0.1)">
-            <h2 style="color:#0056b3;">BCA Converter (Nama Multi-Line Kapital)</h2>
+            <h2 style="color:#0056b3;">BCA Converter (Stopper Logic KCU)</h2>
             <form action="/convert" method="post" enctype="multipart/form-data">
                 <input type="file" name="file" accept=".pdf" required style="margin-bottom:20px;"><br>
                 <button type="submit" style="padding:12px 25px; background:#0056b3; color:white; border:none; border-radius:5px; cursor:pointer; font-weight:bold;">Proses & Download Excel</button>
@@ -227,7 +229,7 @@ def convert():
     if not f: return "File tidak ditemukan"
     data = parse_bca_pdf_logic(io.BytesIO(f.read()))
     excel_file = create_excel_output(data)
-    return send_file(excel_file, as_attachment=True, download_name="Mutasi_BCA_Final.xlsx")
+    return send_file(excel_file, as_attachment=True, download_name="Mutasi_BCA_Stopper.xlsx")
 
 if __name__ == '__main__':
     app.run(debug=True)
