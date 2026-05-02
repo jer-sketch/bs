@@ -24,7 +24,7 @@ def classify(full_text, is_credit):
     if not is_credit: return 'PELUNASAN HUTANG DAGANG', ''
     return 'PENERIMAAN PENJUALAN', '3' 
 
-# --- LOGIKA EKSTRAKSI NAMA & PENJELASAN (V5) ---
+# --- LOGIKA EKSTRAKSI NAMA & PENJELASAN ---
 def extract_nama_refined_v5(block, amount):
     amt_str = "{:.2f}".format(amount)
     found_idx = -1
@@ -32,13 +32,11 @@ def extract_nama_refined_v5(block, amount):
         if amt_str in line.replace(',', ''):
             found_idx = i
             break
-            
     if found_idx == -1: return "", ""
 
     candidates = block[found_idx+1:]
     name_list = []
     desc_list = []
-    
     stoppers = ['KCU', 'PERIODE', 'MATA UANG', 'IDR', 'INDONESIA', 'CATATAN', 'JL ', 'BANDUNG']
     garbage = ['TANGGAL', 'KETERANGAN', 'MUTASI', 'SALDO', 'HALAMAN', 'REKENING', 'CBG']
     
@@ -49,7 +47,6 @@ def extract_nama_refined_v5(block, amount):
         if not c_strip: continue
         c_up = c_strip.upper()
 
-        # 1. Cek Stopper
         for s in stoppers:
             if s in c_up:
                 split_part = re.split(s, c_up, flags=re.IGNORECASE)[0].strip()
@@ -57,32 +54,22 @@ def extract_nama_refined_v5(block, amount):
                 stop_processing = True
                 break
         if stop_processing: break
-
-        # 2. Filter Garbage Header
         if any(g in c_up for g in garbage): continue
 
-        # 3. Logika Pemisahan (Nama vs Penjelasan)
-        # Jika mengandung huruf kecil -> Masuk Penjelasan (misal: 'baud')
         if any(c.islower() for c in c_strip):
             desc_list.append(c_strip)
-        # Jika diawali '/' -> Masuk Penjelasan (misal: '/9938-KCP RA')
         elif c_strip.startswith('/'):
             desc_list.append(c_strip.replace('/', '').strip())
-        # Jika Kapital semua -> Masuk Nama (misal: 'RANI KHOERUN NISA')
         elif c_strip.isupper():
-            # Abaikan jika hanya kode teknis singkat seperti 'DR 002'
             if not re.match(r'^[A-Z]{2}\s\d+$', c_strip):
                 name_list.append(c_strip)
 
-    # Clean Up Nama
     raw_name = " ".join(name_list)
     patterns = [r'\bTRSF\b', r'\bWS\b', r'\bFTSCY\b', r'\bDB\b', r'\bCR\b', r'\bDR\b', r'\bSWITCHING\b']
-    for p in patterns:
-        raw_name = re.sub(p, '', raw_name, flags=re.IGNORECASE)
+    for p in patterns: raw_name = re.sub(p, '', raw_name, flags=re.IGNORECASE)
     
     final_name = " ".join(raw_name.split()).strip().upper()
     final_desc = " ".join(desc_list).strip()
-    
     return final_name, final_desc
 
 # --- LOGIKA PARSING PDF ---
@@ -115,8 +102,7 @@ def parse_bca_pdf_logic(pdf_stream):
         if DATE_RE.match(l):
             if current_block: tx_blocks.append(current_block)
             current_block = [l]
-        elif current_block:
-            current_block.append(l)
+        elif current_block: current_block.append(l)
     if current_block: tx_blocks.append(current_block)
 
     txs = []
@@ -136,7 +122,6 @@ def parse_bca_pdf_logic(pdf_stream):
         if 'BUNGA' in full_text and 'PAJAK' not in full_text: is_db, is_cr = False, True
 
         ket, kode = classify(full_text, is_cr and not is_db)
-        # Output dua nilai dari fungsi baru
         nama_orang, penjelasan = extract_nama_refined_v5(block, amt)
 
         if kode in ['27', '28', '29'] or ket == 'PENERIMAAN NEGARA':
@@ -151,7 +136,6 @@ def parse_bca_pdf_logic(pdf_stream):
             'date': date_str, 'nama': nama_orang, 'ket': ket, 
             'kode': kode, 'debet': debet, 'kredit': kredit, 'penjelasan': penjelasan
         })
-
     return {"txs":txs, "period":period, "saldo_awal":saldo_awal, "total_db":total_db, "total_cr":total_cr}
 
 # --- LOGIKA EXCEL ---
@@ -160,60 +144,103 @@ def create_excel_output(data):
     ws = wb.active
     ws.title = 'Mutasi BCA'
     num_fmt = '#,##0.00'
-    
     ws.append(['BCA 346-8383111'])
     ws.append(['CV. MITRA JAYA ANUGERAH'])
     ws.append([f"PERIODE: {data['period']}"])
     ws.append([]) 
-    
-    # Tambah kolom PENJELASAN di ujung (Kolom I)
     headers = ['NO', 'TANGGAL', 'NAMA', 'KETERANGAN', 'KODE', 'DEBET', 'KREDIT', 'SALDO', 'PENJELASAN']
     ws.append(headers)
     for c in range(1, 10):
         ws.cell(5, c).font = Font(bold=True, color="FFFFFF")
         ws.cell(5, c).fill = PatternFill("solid", start_color="0056b3")
-
     ws.append(['', '', '', 'SALDO AWAL', '', '', '', data['saldo_awal'], ''])
     ws.cell(6, 8).number_format = num_fmt
-    
     curr_saldo = data['saldo_awal']
     row_idx = 7
     for idx, tx in enumerate(data['txs'], 1):
         curr_saldo = round(curr_saldo + tx['kredit'] - tx['debet'], 2)
-        ws.append([
-            idx, tx['date'], tx['nama'], tx['ket'], tx['kode'], 
-            tx['debet'] or '', tx['kredit'] or '', curr_saldo, tx['penjelasan']
-        ])
+        ws.append([idx, tx['date'], tx['nama'], tx['ket'], tx['kode'], 
+                   tx['debet'] or '', tx['kredit'] or '', curr_saldo, tx['penjelasan']])
         row_idx += 1
-
     ws.append(['', '', '', 'TOTAL MUTASI', '', data['total_db'], data['total_cr'], curr_saldo, ''])
     for c in range(4, 9):
         ws.cell(row_idx, c).font = Font(bold=True)
         if c >= 6: ws.cell(row_idx, c).number_format = num_fmt
-
     widths = [5, 12, 25, 25, 8, 15, 15, 18, 30]
-    for i, w in enumerate(widths, 1):
-        ws.column_dimensions[get_column_letter(i)].width = w
-
+    for i, w in enumerate(widths, 1): ws.column_dimensions[get_column_letter(i)].width = w
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
     return out
 
-# --- FLASK APP ---
+# --- FLASK APP + MODERN UI ---
 @app.route('/')
 def index():
     return render_template_string("""
-    <body style="font-family:sans-serif; text-align:center; padding-top:50px; background:#f4f7f6;">
-        <div style="display:inline-block; background:white; padding:40px; border-radius:15px; box-shadow:0 4px 15px rgba(0,0,0,0.1)">
-            <h2 style="color:#0056b3;">PDF to EXCEL</h2>
-            <p>Fitur: Keterangan & Penjelasan</p>
-            <form action="/convert" method="post" enctype="multipart/form-data">
-                <input type="file" name="file" accept=".pdf" required style="margin-bottom:20px;"><br>
-                <button type="submit" style="padding:12px 25px; background:#0056b3; color:white; border:none; border-radius:5px; cursor:pointer; font-weight:bold;">Download Excel</button>
-            </form>
+    <!DOCTYPE html>
+    <html lang="id">
+    <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>BCA PDF to Excel Converter</title>
+        <script src="https://cdn.tailwindcss.com"></script>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+        <style>
+            body { font-family: 'Inter', sans-serif; }
+            .glass { background: rgba(255, 255, 255, 0.95); backdrop-filter: blur(10px); }
+        </style>
+    </head>
+    <body class="bg-slate-50 min-h-screen flex items-center justify-center p-4">
+        <div class="max-w-md w-full glass rounded-3xl shadow-2xl border border-slate-200 overflow-hidden">
+            <div class="bg-blue-600 p-8 text-white text-center">
+                <div class="inline-flex items-center justify-center w-16 h-16 bg-white/20 rounded-2xl mb-4">
+                    <svg class="w-8 h-8" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"></path>
+                    </svg>
+                </div>
+                <h1 class="text-2xl md:text-3xl font-bold tracking-tight">BCA Converter</h1>
+                <p class="text-blue-100 mt-2 text-sm md:text-base">Ekstrak mutasi PDF ke Excel secara otomatis</p>
+            </div>
+            
+            <div class="p-8">
+                <form action="/convert" method="post" enctype="multipart/form-data" id="uploadForm">
+                    <div class="space-y-6">
+                        <div class="relative group">
+                            <label class="block text-sm font-semibold text-slate-700 mb-2">Pilih File PDF Mutasi</label>
+                            <label for="file-upload" class="flex flex-col items-center justify-center w-full h-32 border-2 border-dashed border-slate-300 rounded-xl cursor-pointer bg-slate-50 hover:bg-slate-100 hover:border-blue-400 transition-all">
+                                <div class="flex flex-col items-center justify-center pt-5 pb-6">
+                                    <svg class="w-8 h-8 text-slate-400 mb-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                                    <p id="file-name" class="text-xs md:text-sm text-slate-500 text-center px-4">Klik untuk pilih file</p>
+                                </div>
+                                <input id="file-upload" name="file" type="file" class="hidden" accept=".pdf" required onchange="updateFileName(this)"/>
+                            </label>
+                        </div>
+
+                        <button type="submit" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-xl shadow-lg shadow-blue-200 transition-all active:scale-[0.98] flex items-center justify-center text-base md:text-lg">
+                            <span>Konversi Sekarang</span>
+                            <svg class="w-5 h-5 ml-2" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 7l5 5m0 0l-5 5m5-5H6"></path></svg>
+                        </button>
+                    </div>
+                </form>
+                
+                <div class="mt-8 pt-6 border-t border-slate-100">
+                    <div class="flex items-center text-xs md:text-sm text-slate-400 justify-center">
+                        <svg class="w-4 h-4 mr-1" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M5 9V7a5 5 0 0110 0v2a2 2 0 012 2v5a2 2 0 01-2 2H5a2 2 0 01-2-2v-5a2 2 0 012-2zm8-2v2H7V7a3 3 0 016 0z" clip-rule="evenodd"></path></svg>
+                        Keamanan Terjamin • Pemrosesan Lokal
+                    </div>
+                </div>
+            </div>
         </div>
+
+        <script>
+            function updateFileName(input) {
+                const fileName = input.files[0]?.name || "Klik untuk pilih file";
+                document.getElementById('file-name').textContent = fileName;
+                document.getElementById('file-name').classList.add('text-blue-600', 'font-semibold');
+            }
+        </script>
     </body>
+    </html>
     """)
 
 @app.route('/convert', methods=['POST'])
@@ -222,7 +249,7 @@ def convert():
     if not f: return "File tidak ditemukan"
     data = parse_bca_pdf_logic(io.BytesIO(f.read()))
     excel_file = create_excel_output(data)
-    return send_file(excel_file, as_attachment=True, download_name="Mutasi_BCA_Penjelasan.xlsx")
+    return send_file(excel_file, as_attachment=True, download_name="Mutasi_BCA_V5.xlsx")
 
 if __name__ == '__main__':
     app.run(debug=True)
