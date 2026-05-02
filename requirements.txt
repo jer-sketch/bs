@@ -1,4 +1,4 @@
-flask
 pdfplumber
+pandas
 openpyxl
-werkzeug
+streamlit
