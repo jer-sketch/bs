@@ -1,71 +1,3 @@
-from flask import Flask, request, send_file, render_template_string
-from pypdf import PdfReader
-import pandas as pd
-import openpyxl
-from openpyxl.styles import Font
-import io
-import re
-import traceback
-from datetime import datetime
-
-app = Flask(__name__)
-
-HTML_TEMPLATE = """
-<!DOCTYPE html>
-<html lang="id">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BCA PDF to Excel Converter</title>
-    <style>
-        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; margin: 0; display: flex; align-items: center; justify-content: center; height: 100vh; background-color: #f0f2f5; }
-        .container { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 15px rgba(0,0,0,0.1); text-align: center; width: 400px; }
-        h2 { color: #0056b3; margin-bottom: 20px; }
-        input[type="file"] { margin: 20px 0; border: 1px dashed #0056b3; padding: 10px; width: 100%; border-radius: 5px; }
-        button { background-color: #0056b3; color: white; padding: 12px 24px; border: none; border-radius: 6px; cursor: pointer; font-weight: bold; width: 100%; }
-        button:hover { background-color: #004494; }
-        .footer { margin-top: 20px; font-size: 12px; color: #666; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h2>BCA Converter</h2>
-        <form action="/convert" method="post" enctype="multipart/form-data">
-            <input type="file" name="file" accept=".pdf" required>
-            <button type="submit">Konversi Sekarang</button>
-        </form>
-        <div class="footer">Unggah file e-statement BCA (.pdf)</div>
-    </div>
-</body>
-</html>
-"""
-
-@app.route('/')
-def index():
-    return render_template_string(HTML_TEMPLATE)
-
-@app.route('/convert', methods=['POST'])
-def convert():
-    if 'file' not in request.files:
-        return "Tidak ada file", 400
-    
-    file = request.files['file']
-    try:
-        pdf_bytes = io.BytesIO(file.read())
-        extracted_data = parse_bca_pdf_robust(pdf_bytes)
-        
-        excel_io = create_excel_template(extracted_data)
-        
-        return send_file(
-            excel_io,
-            as_attachment=True,
-            download_name=f"MUTASI_BCA_{datetime.now().strftime('%d%m%Y')}.xlsx",
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-        )
-    except Exception as e:
-        error_details = traceback.format_exc()
-        return f"<h3>Terjadi Kesalahan</h3><pre>{error_details}</pre>", 500
-
 def parse_bca_pdf_robust(pdf_stream):
     data = []
     saldo_awal = 0
@@ -73,60 +5,60 @@ def parse_bca_pdf_robust(pdf_stream):
     
     reader = PdfReader(pdf_stream)
     
+    # Gabungkan semua teks dari semua halaman untuk pencarian tahun & saldo awal
+    full_text = ""
     for page in reader.pages:
-        text = page.extract_text()
-        if not text:
-            continue
-            
-        lines = text.split('\n')
-        for line in lines:
-            line = line.strip()
-            
-            # Cari Tahun
-            if "PERIODE" in line.upper():
-                match_tahun = re.search(r'20\d{2}', line)
-                if match_tahun:
-                    tahun = match_tahun.group(0)
+        full_text += page.extract_text() + "\n"
 
-            # Cari Saldo Awal
-            if "SALDO AWAL" in line.upper():
-                # Mencari angka di akhir baris (format: 1.234.567,89)
-                match_saldo = re.search(r'([\d\.,]+)$', line)
-                if match_saldo:
-                    try:
-                        saldo_awal = float(match_saldo.group(1).replace('.', '').replace(',', '.'))
-                    except: pass
+    # Cari Tahun di seluruh dokumen
+    match_tahun = re.search(r'PERIODE\s*:\s*.*\s+(20\d{2})', full_text, re.IGNORECASE)
+    if match_tahun:
+        tahun = match_tahun.group(1)
+
+    # Cari Saldo Awal (biasanya di tabel ringkasan atau awal mutasi)
+    match_saldo_awal = re.search(r'SALDO AWAL\s+([\d\.,]+)', full_text, re.IGNORECASE)
+    if match_saldo_awal:
+        saldo_awal = float(match_saldo_awal.group(1).replace('.', '').replace(',', '.'))
+
+    # Proses per baris untuk mencari transaksi
+    lines = full_text.split('\n')
+    for line in lines:
+        line = line.strip()
+        
+        # Regex baru yang lebih fleksibel:
+        # 1. Mencari Tanggal (DD/MM) di awal
+        # 2. Mencari Saldo Akhir di paling ujung (angka dengan koma desimal)
+        # 3. Mencari Nominal Mutasi sebelum Saldo Akhir
+        # Pola: TGL [KETERANGAN...] [NOMINAL] [SALDO]
+        match_trx = re.search(r'^(\d{2}/\d{2})\s+(.*?)\s+([\d\.,]+)\s+([\d\.,]+)$', line)
+        
+        if match_trx:
+            tgl_short = match_trx.group(1)
+            keterangan = match_trx.group(2).strip()
+            mutasi_raw = match_trx.group(3)
+            saldo_raw = match_trx.group(4)
             
-            # Cari baris transaksi (Regex disesuaikan untuk output pypdf)
-            # Pola: Tgl(DD/MM) Keterangan (Spasi) Nominal (Spasi) Saldo
-            # Contoh: "01/01 KREDIT OTOMATIS 500.000,00 1.500.000,00"
-            match_trx = re.search(r'^(\d{2}/\d{2})\s+(.*?)\s+([\d\.,]+)\s+([\d\.,]+)$', line)
-            
-            if match_trx:
-                tanggal = match_trx.group(1) + f"/{tahun}"
-                keterangan = match_trx.group(2).strip()
-                # Ganti format ribuan titik ke standar python (1.000,00 -> 1000.00)
-                mutasi_str = match_trx.group(3).replace('.', '').replace(',', '.')
-                saldo_str = match_trx.group(4).replace('.', '').replace(',', '.')
+            try:
+                # Konversi format IDN (1.000,00) ke float (1000.00)
+                mutasi = float(mutasi_raw.replace('.', '').replace(',', '.'))
+                saldo = float(saldo_raw.replace('.', '').replace(',', '.'))
                 
-                try:
-                    mutasi = float(mutasi_str)
-                    saldo = float(saldo_str)
-                    
-                    # Logika Debet/Kredit sederhana
-                    kredit = mutasi if "CR" in keterangan or "DB" not in keterangan else 0
-                    debet = mutasi if kredit == 0 else 0
+                # Logika penentuan Kredit (CR) atau Debet
+                # Di BCA PDF, biasanya ada teks 'CR' di dalam keterangan atau nominal mutasi
+                is_kredit = "CR" in keterangan or "CR" in mutasi_raw
+                kredit = mutasi if is_kredit else 0
+                debet = mutasi if not is_kredit else 0
 
-                    data.append({
-                        "tanggal": tanggal,
-                        "keterangan": keterangan,
-                        "debet": debet,
-                        "kredit": kredit,
-                        "saldo": saldo
-                    })
-                except:
-                    continue
-    
+                data.append({
+                    "tanggal": f"{tgl_short}/{tahun}",
+                    "keterangan": keterangan.replace(" CR", "").replace(" DB", ""),
+                    "debet": debet,
+                    "kredit": kredit,
+                    "saldo": saldo
+                })
+            except:
+                continue
+
     return {"saldo_awal": saldo_awal, "tahun": tahun, "trx": data}
 
 def create_excel_template(data):
@@ -134,37 +66,40 @@ def create_excel_template(data):
     ws = wb.active
     ws.title = "Mutasi"
 
-    # Penulisan Header
+    # Identitas Perusahaan
     ws['A1'] = "BCA 346-8383111"
     ws['A2'] = "CV. MITRA JAYA ANUGERAH"
-    ws['A3'] = f"TAHUN {data.get('tahun', '2025')}"
+    ws['A3'] = f"TAHUN {data['tahun']}"
     
+    # Header Tabel
     headers = ["NO", "TANGGAL", "NAMA", "KETERANGAN", "KODE", "DEBET", "KREDIT", "SALDO"]
-    ws.append([]) # Baris 4
+    ws.append([]) # Baris 4 kosong
     ws.append(headers) # Baris 5
     
+    # Styling Header
     for col in range(1, 9):
-        ws.cell(row=5, column=col).font = Font(bold=True)
+        cell = ws.cell(row=5, column=col)
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal='center')
 
+    # Baris Saldo Awal
     ws.append(["", "", "", "SALDO AWAL", "", "", "", data['saldo_awal']])
     
+    # Isi Data Transaksi
     for idx, row in enumerate(data['trx'], start=1):
-        kode = 5 if row['kredit'] > 0 else ""
         ws.append([
             idx,
             row['tanggal'],
-            "", 
+            "", # Kolom NAMA sengaja kosong sesuai template
             row['keterangan'],
-            kode,
+            5 if row['kredit'] > 0 else "", # KODE 5 jika ada uang masuk
             row['debet'] if row['debet'] > 0 else 0,
             row['kredit'] if row['kredit'] > 0 else 0,
             row['saldo']
         ])
 
+    # Simpan ke stream
     excel_io = io.BytesIO()
     wb.save(excel_io)
     excel_io.seek(0)
     return excel_io
-
-if __name__ == '__main__':
-    app.run(debug=True)
