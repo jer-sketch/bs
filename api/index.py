@@ -206,8 +206,8 @@ def index():
     return render_template_string("""
     <body style="font-family:sans-serif; text-align:center; padding-top:50px; background:#f4f7f6;">
         <div style="display:inline-block; background:white; padding:40px; border-radius:15px; box-shadow:0 4px 15px rgba(0,0,0,0.1)">
-            <h2 style="color:#0056b3;">BCA Converter v5</h2>
-            <p>Fitur: Kolom Penjelasan & Pemisah Nama Kapital</p>
+            <h2 style="color:#0056b3;">PDF to EXCEL</h2>
+            <p>Fitur: Keterangan & Penjelasan</p>
             <form action="/convert" method="post" enctype="multipart/form-data">
                 <input type="file" name="file" accept=".pdf" required style="margin-bottom:20px;"><br>
                 <button type="submit" style="padding:12px 25px; background:#0056b3; color:white; border:none; border-radius:5px; cursor:pointer; font-weight:bold;">Download Excel</button>
