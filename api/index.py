@@ -9,9 +9,6 @@ from datetime import datetime
 
 app = Flask(__name__)
 
-MONTH_MAP = {'JANUARI':1,'FEBRUARI':2,'MARET':3,'APRIL':4,'MEI':5,'JUNI':6,
-             'JULI':7,'AGUSTUS':8,'SEPTEMBER':9,'OKTOBER':10,'NOVEMBER':11,'DESEMBER':12}
-
 def classify(line, is_credit):
     u = line.upper()
     if 'BIAYA ADM' in u: return 'BIAYA ADM BANK', '27'
@@ -23,41 +20,31 @@ def classify(line, is_credit):
     if 'GAJI' in u: return 'BIAYA GAJI PEGAWAI', ''
     if 'SETORAN TUNAI' in u: return 'SETORAN TUNAI', '1'
     
-    # Dibuat lebih kebal terhadap spasi ganda
-    if 'PENERIMAAN ' in u and 'NEGARA' in u: return 'PENERIMAAN NEGARA', ''
+    # Sangat kuat untuk mendeteksi Penerimaan Negara biarpun terpotong spasinya
+    if 'PENERIMAAN NEGARA' in u or '95051' in u: return 'PENERIMAAN NEGARA', ''
     
     if not is_credit: return 'PELUNASAN HUTANG DAGANG', ''
     
-    # Jika masuk uang dan bukan hal di atas, maka Penjualan
     return 'PENERIMAAN PENJUALAN', '3' 
 
 def extract_nama(desc):
-    """
-    Fungsi khusus untuk membuang keyword bank dan nomor referensi,
-    sehingga hanya menyisakan Nama Orang atau Perusahaan.
-    """
-    # 1. Buang angka nominal di ujung kalimat
-    clean = re.sub(r'[\d,]+\.\d{2}.*$', '', desc).strip()
+    # 1. Hilangkan nominal bank di ujung string (contoh: 1.500.000,00 DB)
+    clean = re.sub(r'[\d,]+\.\d{2}\s*(?:DB|CR)?$', '', desc, flags=re.IGNORECASE).strip()
+    clean = re.sub(r'\b(CR|DB)\b', '', clean, flags=re.IGNORECASE).strip()
     
-    # 2. Buang tanda CR atau DB
-    clean = re.sub(r'\s+(CR|DB)\b', '', clean, flags=re.IGNORECASE)
+    # 2. Buang awalan khusus BIF TRANSFER DR/CR <kode_bank> (Menyisakan Nama PT)
+    clean = re.sub(r'^BIF TRANSFER\s+(?:DR|CR|DB)?\s*\d+\s+', '', clean, flags=re.IGNORECASE)
     
-    # 3. Buang kata-kata mutasi sistem bank
-    bank_keywords = [
-        r'TRSF E-BANKING', r'SWITCHING', r'KR OTOMATIS', r'DR OTOMATIS',
-        r'BIF TRANSFER DR', r'BIF TRANSFER CR', r'BIF TRANSFER',
-        r'TRANSFER DR', r'TRANSFER CR', r'SETORAN TUNAI', r'BYR VIA',
-        r'M-BCA', r'KARTU KREDIT', r'AUTO-DEBET'
-    ]
-    for kw in bank_keywords:
-        clean = re.sub(kw, '', clean, flags=re.IGNORECASE)
-        
-    # 4. Buang kata yang mengandung angka (seperti nomor ref: 0105/FTSCY/WS9)
-    clean = re.sub(r'\S*\d+\S*', '', clean)
+    # 3. Buang awalan transfer dari sistem lain
+    clean = re.sub(r'^TRSF E-BANKING\s+(?:DR|CR|DB)?\s+', '', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'^SWITCHING\s+(?:DR|CR|DB)?\s+', '', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'^TRANSFER\s+(?:DR|CR|DB)?\s+', '', clean, flags=re.IGNORECASE)
+    clean = re.sub(r'^(KR OTOMATIS|DR OTOMATIS|SETORAN TUNAI|BYR VIA|M-BCA)\s*(?:CR|DR|DB)?\s*', '', clean, flags=re.IGNORECASE)
     
-    # 5. Rapikan spasi dan simbol sisa
-    clean = clean.strip(' -/:')
-    return re.sub(r'\s+', ' ', clean).strip()
+    # 4. Hapus sisa nomor referensi di depan (misal: 002, 1202/FTSCY/WS9) tanpa memotong huruf NAMA
+    clean = re.sub(r'^\d+[A-Z0-9/-]*\s+', '', clean)
+    
+    return clean.strip()
 
 def parse_bca_pdf_logic(pdf_stream):
     all_lines = []
@@ -90,39 +77,60 @@ def parse_bca_pdf_logic(pdf_stream):
                      'JL LEUWI','BANDUNG','INDONESIA','NO. REKENING','HALAMAN',
                      'PERIODE','MATA UANG','CATATAN','Apabila','Rekening ini',
                      'telah menyetujui','BCA berhak','Laporan Mutasi',
-                     'TANGGAL KETERANGAN','SALDO AWAL :','MUTASI CR','MUTASI DB','SALDO AKHIR')
+                     'TANGGAL KETERANGAN','SALDO AWAL :','MUTASI CR','MUTASI DB','SALDO AKHIR',
+                     'SALDO AWAL')
 
-    txs = []
+    # 1. BERSINKAN BARIS (Hapus Header/Footer Bank)
+    clean_lines = []
     for l in all_lines:
         l = l.strip()
-        dm = DATE_RE.match(l)
+        if not l: continue
+        if any(l.startswith(h) for h in header_starts): continue
+        if 'Bersambung' in l: continue
+        clean_lines.append(l)
+
+    # 2. GABUNGKAN BARIS (Obat mujarab untuk kalimat yang di-enter oleh BCA)
+    tx_blocks = []
+    curr = ""
+    for l in clean_lines:
+        if re.match(r'^\d{2}/\d{2}\s+', l):
+            if curr: tx_blocks.append(curr)
+            curr = l
+        else:
+            if curr: curr += " " + l
+    if curr: tx_blocks.append(curr)
+
+    # 3. PROSES SETIAP BLOK TRANSAKSI UTUH
+    txs = []
+    for block in tx_blocks:
+        dm = DATE_RE.match(block)
         if not dm: continue
         
         day, mon, rest = dm.group(1), dm.group(2), dm.group(3).strip()
-        if 'SALDO AWAL' in rest or 'Bersambung' in rest: continue
-        if any(rest.startswith(h) for h in header_starts): continue
-
         date = f'{day}/{mon}/{year}'
+        
         all_amounts = re.findall(r'([\d,]+\.\d{2})', rest)
         if not all_amounts: continue
 
         amt = float(all_amounts[0].replace(',',''))
         u = rest.upper()
         
-        is_cr = (' CR ' in u or 'SETORAN TUNAI' in u or 'KR OTOMATIS' in u or 'SWITCHING CR' in u)
-        is_db = (' DB ' in u or 'BYR VIA' in u)
+        is_cr = (' CR ' in u or u.endswith(' CR') or 'SETORAN TUNAI' in u or 'KR OTOMATIS' in u or 'SWITCHING CR' in u)
+        is_db = (' DB ' in u or u.endswith(' DB') or 'BYR VIA' in u)
 
         if any(x in u for x in ['BIAYA ADM', 'PAJAK BUNGA', 'PAJAK JASA']):
             is_db, is_cr = True, False
         if 'BUNGA' in u and not ('PAJAK' in u):
             is_db, is_cr = False, True
 
-        # Klasifikasi kategori
+        # Panggil fungsi klasifikasi dan fungsi penyaring nama
         ket, kode = classify(rest, is_cr and not is_db)
-        
-        # Ekstraksi Nama
         nama_orang = extract_nama(rest)
         
+        # Kosongkan Kolom Nama khusus untuk Penerimaan Negara agar excel lebih rapi
+        if ket == 'PENERIMAAN NEGARA':
+            nama_orang = ''
+
         debet = amt if is_db else 0
         kredit = amt if (is_cr and not is_db) else 0
         if debet == 0 and kredit == 0: kredit = amt
@@ -146,7 +154,6 @@ def create_excel_output(data):
     ws = wb.active
     ws.title = 'Mutasi BCA'
     
-    # Styles
     hdr_font = Font(name='Arial', bold=True, size=10)
     data_font = Font(name='Arial', size=10)
     num_fmt = '#,##0.00'
@@ -155,20 +162,17 @@ def create_excel_output(data):
     ws.append(['BCA 346-8383111'])
     ws.append(['CV. MITRA JAYA ANUGERAH'])
     ws.append([f"PERIODE: {data['period']}"])
-    ws.append([]) # Baris Kosong
+    ws.append([]) 
     
-    # Header Tabel
     headers = ['NO', 'TANGGAL', 'NAMA', 'KETERANGAN', 'KODE', 'DEBET', 'KREDIT', 'SALDO']
     ws.append(headers)
     
-    # Formatting Header Tabel
     for col_num in range(1, len(headers) + 1):
         cell = ws.cell(row=5, column=col_num)
         cell.font = Font(name='Arial', bold=True, color="FFFFFF")
         cell.fill = PatternFill(start_color="0056b3", end_color="0056b3", fill_type="solid")
         cell.alignment = center_align
     
-    # Baris Saldo Awal
     ws.append(['', '', '', 'SALDO AWAL', '', '', '', data['saldo_awal']])
     ws.cell(row=6, column=8).number_format = num_fmt
     
@@ -182,28 +186,24 @@ def create_excel_output(data):
         ws.append([
             idx, 
             tx['date'], 
-            tx['nama'],  # <--- Nama masuk ke kolom C (NAMA)
-            tx['ket'],   # <--- Klasifikasi masuk ke kolom D (KETERANGAN)
+            tx['nama'],  
+            tx['ket'],   
             tx['kode'],
             tx['debet'] if tx['debet'] > 0 else '', 
             tx['kredit'] if tx['kredit'] > 0 else '',
             current_saldo
         ])
 
-    # Footer Tabel
     ws.append([])
     ws.append(['', '', '', 'TOTAL MUTASI', '', data['mut_db'], data['mut_cr'], data['saldo_akhir']])
     
-    # Menerapkan Font dan Format Angka pada data
     for row in ws.iter_rows(min_row=7):
         for cell in row:
             cell.font = data_font
-            # Jika sel ada di kolom Debet (6), Kredit (7), Saldo (8) dan berupa angka
             if cell.column in [6, 7, 8] and isinstance(cell.value, (int, float)):
                 cell.number_format = num_fmt
 
-    # Lebar Kolom yang Nyaman
-    widths = [5, 12, 25, 28, 8, 16, 16, 18]
+    widths = [5, 12, 28, 28, 8, 16, 16, 18]
     for i, w in enumerate(widths, 1):
         ws.column_dimensions[get_column_letter(i)].width = w
 
