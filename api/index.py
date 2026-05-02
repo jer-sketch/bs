@@ -24,7 +24,7 @@ def classify(line, is_credit):
     if 'SETORAN TUNAI' in u: return 'SETORAN TUNAI', '1'
     
     # Dibuat lebih kebal terhadap spasi ganda
-    if 'PENERIMAAN' in u and 'NEGARA' in u: return 'PENERIMAAN NEGARA', ''
+    if 'PENERIMAAN ' in u and 'NEGARA' in u: return 'PENERIMAAN NEGARA', ''
     
     if not is_credit: return 'PELUNASAN HUTANG DAGANG', ''
     
