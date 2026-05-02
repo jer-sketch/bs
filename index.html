@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BCA PDF Converter</title>
+    <style>
+        body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }
+        .card { background: white; padding: 2rem; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); width: 100%; max-width: 400px; text-align: center; }
+        h2 { color: #0056b3; margin-bottom: 1.5rem; }
+        input[type="file"] { margin: 1rem 0; width: 100%; }
+        button { background: #0056b3; color: white; border: none; padding: 12px 20px; border-radius: 6px; cursor: pointer; width: 100%; font-size: 16px; transition: 0.3s; }
+        button:hover { background: #004494; }
+        .footer { margin-top: 1.5rem; font-size: 12px; color: #888; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>BCA to Excel</h2>
+        <p>Upload E-Statement PDF untuk dikonversi</p>
+        <form action="/api/index" method="post" enctype="multipart/form-data">
+            <input type="file" name="file" accept=".pdf" required>
+            <button type="submit">Konversi Sekarang</button>
+        </form>
+        <div class="footer">Data diproses secara aman di serverless Vercel</div>
+    </div>
+</body>
+</html>
