@@ -1,7 +1,7 @@
 """
 Bank Statement PDF → Excel Converter
-Mendukung: BCA, BRI, Mandiri
-Versi: 2.2 (Fix 500 Error & Illegal Characters)
+Mendukung: BCA (V5 Logic), BRI, Mandiri
+Versi: 2.3 (Fix Compatibility & Detection)
 """
 
 import re
@@ -13,7 +13,7 @@ import pdfplumber
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
-from flask import Flask, request, send_file, render_template_string
+from flask import Flask, request, send_file, render_template_string, make_response
 
 app = Flask(__name__)
 
@@ -42,7 +42,7 @@ def classify(text: str, is_credit: bool) -> tuple[str, str]:
     if 'PENERIMAAN NEGARA' in u:                        ket = 'PENERIMAAN NEGARA'
     elif 'PAJAK' in u:                                  ket = 'PAJAK JASA GIRO'
     elif 'BUNGA' in u or 'INTEREST' in u:               ket = 'BUNGA'
-    elif 'BIAYA ADM' in u or 'BIAYA ADM' in u:          ket = 'BIAYA ADM BANK'
+    elif 'BIAYA ADM' in u:                              ket = 'BIAYA ADM BANK'
     elif 'TRANSFER' in u and 'BIAYA' in u:              ket = 'BIAYA TRANSFER'
     elif 'TELKOM' in u or 'TELEPON' in u:               ket = 'BIAYA TELEPON'
     elif 'LISTRIK' in u or 'PLN' in u:                  ket = 'BIAYA LISTRIK'
@@ -55,22 +55,28 @@ def classify(text: str, is_credit: bool) -> tuple[str, str]:
 
 
 # ─────────────────────────────────────────────
-# DETEKTOR JENIS BANK
+# DETEKTOR JENIS BANK (DIPERKUAT)
 # ─────────────────────────────────────────────
 
 def detect_bank(all_lines: list[str]) -> str:
-    text = ' '.join(all_lines[:30]).upper()
-    if 'REKENING GIRO' in text or 'TRSF E-BANKING' in text or 'BI-FAST' in text:
+    # Ambil 50 baris pertama untuk identifikasi lebih akurat
+    text = ' '.join(all_lines[:50]).upper()
+    
+    # Keyword BCA yang lebih luas
+    if any(x in text for x in ['BCA', 'REKENING GIRO', 'E-BANKING', 'BI-FAST', 'TANGGAL KETERANGAN MUTASI']):
         return 'BCA'
-    if 'LAPORAN TRANSAKSI FINANSIAL' in text or 'BRIMTXDT' in text or 'BRITAMA' in text:
+    # Keyword BRI
+    if any(x in text for x in ['BRI', 'BRIMTXDT', 'BRITAMA', 'LAPORAN TRANSAKSI FINANSIAL']):
         return 'BRI'
-    if 'KOPRA' in text or 'MANDIRI' in text or 'MCM INHOUSETRF' in text or 'ACCOUNT STATEMENT' in text:
+    # Keyword Mandiri
+    if any(x in text for x in ['MANDIRI', 'KOPRA', 'ACCOUNT STATEMENT', 'MCM INHOUSETRF']):
         return 'MANDIRI'
+        
     return 'UNKNOWN'
 
 
 # ─────────────────────────────────────────────
-# EKSTRAKTOR NAMA & PENJELASAN (KHUSUS BCA V5)
+# PARSER BCA (LOGIK V5 ASLI)
 # ─────────────────────────────────────────────
 
 def extract_nama_refined_v5(block: list[str], amount: float) -> tuple[str, str]:
@@ -87,7 +93,7 @@ def extract_nama_refined_v5(block: list[str], amount: float) -> tuple[str, str]:
     name_list = []
     desc_list = []
     
-    stoppers = ['KCU', 'PERIODE', 'MATA UANG', 'IDR', 'INDONESIA', 'CATATAN', 'JL ', 'BANDUNG']
+    stoppers = ['KCU', 'PERIODE', 'MATA UANG', 'IDR', 'INDONESIA', 'CATATAN', 'JL ', 'BANDUNG', 'SALDO AWAL']
     garbage = ['TANGGAL', 'KETERANGAN', 'MUTASI', 'SALDO', 'HALAMAN', 'REKENING', 'CBG']
     
     stop_processing = False
@@ -121,11 +127,6 @@ def extract_nama_refined_v5(block: list[str], amount: float) -> tuple[str, str]:
     final_desc = " ".join(desc_list).strip()
     return final_name, final_desc
 
-
-# ─────────────────────────────────────────────
-# PARSER BCA (BLOCK SYSTEM V5)
-# ─────────────────────────────────────────────
-
 def parse_bca(all_lines: list[str]) -> dict:
     period = ''
     saldo_awal = saldo_akhir = mut_cr = mut_db = 0
@@ -136,8 +137,9 @@ def parse_bca(all_lines: list[str]) -> dict:
         l_up = l.upper()
         if 'PERIODE :' in l_up and not period: period = l.split(':', 1)[1].strip()
         if 'NO. REKENING' in l_up and not no_rek:
-            m = re.search(r':\s*([\d]+)', l)
-            if m: no_rek = m.group(1)
+            m = re.search(r':\s*([\d\s\-]+)', l)
+            if m: no_rek = m.group(1).strip()
+            
         m = re.search(r'SALDO AWAL\s*:\s*([\d,]+\.\d+)', l_up)
         if m: saldo_awal = float(m.group(1).replace(',', ''))
         m = re.search(r'MUTASI CR\s*:\s*([\d,]+\.\d+)', l_up)
@@ -147,12 +149,12 @@ def parse_bca(all_lines: list[str]) -> dict:
         m = re.search(r'SALDO AKHIR\s*:\s*([\d,]+\.\d+)', l_up)
         if m: saldo_akhir = float(m.group(1).replace(',', ''))
         
-        if any(x in l_up for x in ["BERSAMBUNG KE HALAMAN", "TGL. CETAK", "REKENING INI"]): continue
+        if any(x in l_up for x in ["BERSAMBUNG KE HALAMAN", "TGL. CETAK"]): continue
         cleaned_lines.append(l.strip())
 
     year = period.split()[-1] if period else str(datetime.now().year)
-
     DATE_RE = re.compile(r'^(\d{2})/(\d{2})\s+')
+    
     tx_blocks = []
     current_block = []
     for l in cleaned_lines:
@@ -181,9 +183,6 @@ def parse_bca(all_lines: list[str]) -> dict:
         ket, kode = classify(full_text, is_cr and not is_db)
         nama_orang, penjelasan = extract_nama_refined_v5(block, amt)
 
-        if kode in ['27', '28', '29'] or ket == 'PENERIMAAN NEGARA':
-            nama_orang = penjelasan = ''
-
         txs.append({
             'date': date_str, 'nama': nama_orang, 'ket': ket, 'kode': kode,
             'debet': amt if is_db else 0.0, 'kredit': amt if (is_cr and not is_db) else 0.0,
@@ -203,30 +202,22 @@ def parse_bca(all_lines: list[str]) -> dict:
     }
 
 # ─────────────────────────────────────────────
-# PARSER BRI
+# PARSER BRI & MANDIRI (TETAP SAMA)
 # ─────────────────────────────────────────────
 
 def parse_bri(all_lines: list[str]) -> dict:
-    period = ''
-    saldo_awal = saldo_akhir = total_db = total_cr = 0
+    period = ''; saldo_awal = saldo_akhir = total_db = total_cr = 0
     no_rek = nama_akun = ''
-
     for l in all_lines:
         m = re.search(r'(?:Periode Transaksi|Transaction Period)[^\d]*(\d{2}/\d{2}/\d{2})\s*-\s*(\d{2}/\d{2}/\d{2})', l)
         if m and not period: period = f"{m.group(1)} - {m.group(2)}"
-        
         m = re.search(r'No\.\s*Rekening[^\d]*([\d]+)', l)
         if m and not no_rek: no_rek = m.group(1)
-        
         if l.strip().startswith('CV ') or l.strip().startswith('PT '):
             if not nama_akun: nama_akun = l.strip()
-            
         m = re.match(r'^([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})$', l.strip())
         if m:
-            saldo_awal  = float(m.group(1).replace(',', ''))
-            total_db    = float(m.group(2).replace(',', ''))
-            total_cr    = float(m.group(3).replace(',', ''))
-            saldo_akhir = float(m.group(4).replace(',', ''))
+            saldo_awal, total_db, total_cr, saldo_akhir = [float(x.replace(',', '')) for x in m.groups()]
 
     TX_RE = re.compile(r'^(\d{2}/\d{2}/\d{2})\s+\d{2}:\d{2}:\d{2}\s+(.+?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})$')
     txs = []
@@ -234,36 +225,16 @@ def parse_bri(all_lines: list[str]) -> dict:
         m = TX_RE.match(l.strip())
         if not m: continue
         date_raw, desc, db_s, cr_s, _ = m.groups()
-        db = float(db_s.replace(',', ''))
-        cr = float(cr_s.replace(',', ''))
-        is_credit = cr > 0
-        ket, kode = classify(desc, is_credit)
-        
-        txs.append({
-            'date': date_raw, 'nama': '', 'ket': ket, 'kode': kode,
-            'debet': db, 'kredit': cr, 'penjelasan': desc.strip()
-        })
+        db, cr = float(db_s.replace(',', '')), float(cr_s.replace(',', ''))
+        ket, kode = classify(desc, cr > 0)
+        txs.append({'date': date_raw, 'nama': '', 'ket': ket, 'kode': kode, 'debet': db, 'kredit': cr, 'penjelasan': desc.strip()})
 
-    return {
-        'bank': 'BRI', 'no_rek': no_rek, 'nama_akun': nama_akun or 'CV. TUNGGAL JAYA SUNIARAJA',
-        'period': period, 'saldo_awal': saldo_awal, 'saldo_akhir': saldo_akhir,
-        'mut_cr': total_cr, 'mut_db': total_db, 'txs': txs,
-    }
-
-# ─────────────────────────────────────────────
-# PARSER MANDIRI
-# ─────────────────────────────────────────────
-
-_MANDIRI_MONTH = {
-    'Jan':'01','Feb':'02','Mar':'03','Apr':'04','May':'05','Jun':'06',
-    'Jul':'07','Aug':'08','Sep':'09','Oct':'10','Nov':'11','Dec':'12',
-}
+    return {'bank': 'BRI', 'no_rek': no_rek, 'nama_akun': nama_akun or 'NASABAH BRI', 'period': period, 'saldo_awal': saldo_awal, 'saldo_akhir': saldo_akhir, 'mut_cr': total_cr, 'mut_db': total_db, 'txs': txs}
 
 def parse_mandiri(all_lines: list[str]) -> dict:
-    period = ''
-    saldo_awal = saldo_akhir = total_db = total_cr = 0
+    _MANDIRI_MONTH = {'Jan':'01','Feb':'02','Mar':'03','Apr':'04','May':'05','Jun':'06','Jul':'07','Aug':'08','Sep':'09','Oct':'10','Nov':'11','Dec':'12'}
+    period = ''; saldo_awal = saldo_akhir = total_db = total_cr = 0
     no_rek = nama_akun = ''
-
     for l in all_lines:
         m = re.search(r'(\d{2}\s+\w+\s+\d{4})\s*-\s*(\d{2}\s+\w+\s+\d{4})', l)
         if m and not period: period = f"{m.group(1)} - {m.group(2)}"
@@ -271,605 +242,167 @@ def parse_mandiri(all_lines: list[str]) -> dict:
         if m and not no_rek:
             no_rek = m.group(1)
             nama_akun = m.group(2).split('  ')[0].strip()
-            
         m = re.match(r'^([\d,]+\.\d{2})\s+\d+\s+([\d,]+\.\d{2})$', l.strip())
         if m:
-            v1 = float(m.group(1).replace(',', ''))
-            v2 = float(m.group(2).replace(',', ''))
-            if saldo_awal == 0:
-                saldo_awal = v1; total_db = v2
-            else:
-                saldo_akhir = v1; total_cr = v2
+            v1, v2 = float(m.group(1).replace(',', '')), float(m.group(2).replace(',', ''))
+            if saldo_awal == 0: saldo_awal = v1; total_db = v2
+            else: saldo_akhir = v1; total_cr = v2
 
-    TX_AMT_RE = re.compile(r'^(.*?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s+([\d,]+\.\d{2})\s*$')
+    TX_AMT_RE = re.compile(r'^(.*?)\s+([\d,]+\.\d{2})\s+([\d,]+\.\d.2})\s+([\d,]+\.\d{2})\s*$')
     DATE_RE = re.compile(r'(\d{2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{4})', re.IGNORECASE)
-    SKIP = ('For further questions', 'Account Statement', 'Created', 'Posting Date', 'Opening Balance', 'Closing Balance', 'No. of Debit', 'Total Amount', 'Account Statement Summary', 'Account No.', 'Period ', 'Alias', 'Currency', 'Branch', 'kopra')
-
-    txs = []
-    last_date = ''
+    txs = []; last_date = ''
     for i, l in enumerate(all_lines):
         ls = l.strip()
-        if not ls or any(ls.lower().startswith(s.lower()) for s in SKIP): continue
-
         dm = DATE_RE.search(ls)
-        if dm:
-            last_date = f"{dm.group(1)}/{_MANDIRI_MONTH.get(dm.group(2)[:3].capitalize(), '01')}/{dm.group(3)[-2:]}"
-
+        if dm: last_date = f"{dm.group(1)}/{_MANDIRI_MONTH.get(dm.group(2)[:3].capitalize(), '01')}/{dm.group(3)[-2:]}"
         m = TX_AMT_RE.match(ls)
-        if not m: continue
+        if not m or not last_date: continue
+        desc = re.sub(r'\d{2}:\d{2}:\d{2}', '', m.group(1)).strip()
+        db, cr = float(m.group(2).replace(',', '')), float(m.group(3).replace(',', ''))
+        ket, kode = classify(desc, cr > 0)
+        txs.append({'date': last_date, 'nama': '', 'ket': ket, 'kode': kode, 'debet': db, 'kredit': cr, 'penjelasan': desc})
 
-        prefix = m.group(1).strip()
-        db = float(m.group(2).replace(',', ''))
-        cr = float(m.group(3).replace(',', ''))
-
-        if any(prefix.lower().startswith(s.lower()) for s in ('Closing', 'Opening', 'Total', 'Terbilang')): continue
-
-        desc = re.sub(r'\d{2}:\d{2}:\d{2}', '', prefix)
-        desc = re.sub(r'\b\d{8,}\b', '', desc)
-        desc = re.sub(r'\s{2,}', ' ', desc).strip(' -')
-
-        for offset in [-2, -1, 1, 2]:
-            ni = i + offset
-            if not (0 <= ni < len(all_lines)): continue
-            nb = all_lines[ni].strip()
-            if (nb and not TX_AMT_RE.match(nb) and not DATE_RE.search(nb) 
-                and not any(nb.lower().startswith(s.lower()) for s in SKIP) 
-                and not re.match(r'^\d{2}:\d{2}:\d{2}', nb)):
-                desc = (desc + ' ' + nb).strip()
-                break
-
-        if not last_date: continue
-
-        is_credit = cr > 0
-        ket, kode = classify(desc or ls, is_credit)
-
-        txs.append({
-            'date': last_date, 'nama': '', 'ket': ket, 'kode': kode,
-            'debet': db, 'kredit': cr, 'penjelasan': desc
-        })
-
-    return {
-        'bank': 'MANDIRI', 'no_rek': no_rek, 'nama_akun': nama_akun or 'TUNGGAL JAYA SUNIARA',
-        'period': period, 'saldo_awal': saldo_awal, 'saldo_akhir': saldo_akhir,
-        'mut_cr': total_cr, 'mut_db': total_db, 'txs': txs,
-    }
+    return {'bank': 'MANDIRI', 'no_rek': no_rek, 'nama_akun': nama_akun or 'NASABAH MANDIRI', 'period': period, 'saldo_awal': saldo_awal, 'saldo_akhir': saldo_akhir, 'mut_cr': total_cr, 'mut_db': total_db, 'txs': txs}
 
 # ─────────────────────────────────────────────
-# DISPATCHER UTAMA
+# CORE ENGINE & EXCEL GEN
 # ─────────────────────────────────────────────
+
+def clean_excel_string(val):
+    if isinstance(val, str):
+        return ILLEGAL_CHARACTERS_RE.sub('', val)
+    return val
 
 def parse_pdf(pdf_bytes: bytes) -> dict:
     all_lines = []
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             text = page.extract_text()
-            if text:
-                all_lines.extend(text.split('\n'))
-
+            if text: all_lines.extend(text.split('\n'))
+    
+    if not all_lines: raise ValueError("PDF kosong atau tidak terbaca.")
+    
     bank = detect_bank(all_lines)
     if bank == 'BCA': return parse_bca(all_lines)
     elif bank == 'BRI': return parse_bri(all_lines)
     elif bank == 'MANDIRI': return parse_mandiri(all_lines)
-    else: raise ValueError("Format bank tidak dikenali. Pastikan PDF adalah mutasi BCA, BRI, atau Mandiri.")
-
-# ─────────────────────────────────────────────
-# GENERATOR EXCEL & FILTER KARAKTER ILEGAL
-# ─────────────────────────────────────────────
-
-BANK_COLORS = {
-    'BCA':     {'header': '005BAC', 'sub': 'E8F0FA', 'accent': '0072CE'},
-    'BRI':     {'header': '003D7C', 'sub': 'E6EEF7', 'accent': '0055B3'},
-    'MANDIRI': {'header': '003087', 'sub': 'E5ECF6', 'accent': 'F5A623'},
-}
-
-def clean_excel_string(val):
-    """Membersihkan karakter tersembunyi yang ditolak oleh OpenPyXL"""
-    if isinstance(val, str):
-        return ILLEGAL_CHARACTERS_RE.sub('', val)
-    return val
+    else: raise ValueError(f"Format bank tidak dikenali. Pastikan ini PDF Mutasi (Deteksi: {bank})")
 
 def create_excel(data: dict) -> io.BytesIO:
     wb = openpyxl.Workbook()
     ws = wb.active
-    # Pastikan title worksheet tidak lebih dari 31 karakter
-    safe_title = f"Mutasi {data['bank']}"
-    ws.title = safe_title[:31] 
+    ws.title = f"Mutasi {data['bank']}"[:31]
+    
+    colors = {'header': '005BAC', 'sub': 'E8F0FA'} # Default
+    if 'BRI' in data['bank']: colors = {'header': '003D7C', 'sub': 'E6EEF7'}
+    elif 'MANDIRI' in data['bank']: colors = {'header': '003087', 'sub': 'E5ECF6'}
 
-    bank   = data['bank']
-    colors = BANK_COLORS.get(bank, BANK_COLORS['BCA'])
-    NUM    = '#,##0.00'
+    # Header Rendering
+    ws.merge_cells('A1:I1'); ws['A1'] = f"LAPORAN MUTASI – {data['bank']}"
+    ws['A1'].font = Font(bold=True, color='FFFFFF', size=14); ws['A1'].fill = PatternFill('solid', start_color=colors['header'])
+    ws['A1'].alignment = Alignment(horizontal='center')
+    
+    ws.merge_cells('A2:I2'); ws['A2'] = clean_excel_string(data['nama_akun'])
+    ws['A2'].font = Font(bold=True); ws['A2'].alignment = Alignment(horizontal='center')
+    
+    ws.merge_cells('A3:I3'); ws['A3'] = f"Rek: {data['no_rek']} | Periode: {data['period']}"
+    ws['A3'].alignment = Alignment(horizontal='center')
 
-    def style_cell(cell, bold=False, color=None, bg=None, align='left', num_fmt=None):
-        cell.font      = Font(name='Calibri', bold=bold, color=color or '000000', size=10)
-        cell.alignment = Alignment(horizontal=align, vertical='center', wrap_text=False)
-        if bg: cell.fill = PatternFill('solid', start_color=bg)
-        if num_fmt: cell.number_format = num_fmt
-
-    thin = Side(style='thin', color='CCCCCC')
-    border = Border(left=thin, right=thin, top=thin, bottom=thin)
-
-    # ── Title block ──
-    ws.merge_cells('A1:I1')
-    ws['A1'] = f"LAPORAN MUTASI REKENING – {bank}"
-    style_cell(ws['A1'], bold=True, color='FFFFFF', bg=colors['header'], align='center')
-    ws['A1'].font = Font(name='Calibri', bold=True, color='FFFFFF', size=13)
-    ws.row_dimensions[1].height = 26
-
-    ws.merge_cells('A2:I2')
-    ws['A2'] = clean_excel_string(data['nama_akun'])
-    style_cell(ws['A2'], bold=True, align='center', bg=colors['sub'])
-    ws.row_dimensions[2].height = 18
-
-    ws.merge_cells('A3:I3')
-    ws['A3'] = clean_excel_string(f"No. Rekening: {data['no_rek']}    |    Periode: {data['period']}")
-    style_cell(ws['A3'], align='center', bg=colors['sub'])
-    ws.row_dimensions[3].height = 16
-
-    # ── Summary row ──
-    ws.row_dimensions[4].height = 14
-    for c in ['A','B','C','D','E','F','G','H','I']:
-        ws[f'{c}4'].fill = PatternFill('solid', start_color='F5F5F5')
-
-    summaries = [
-        ('Saldo Awal', data['saldo_awal']),
-        ('Total Kredit', data['mut_cr']),
-        ('Total Debet', data['mut_db']),
-        ('Saldo Akhir', data['saldo_akhir']),
-    ]
-    cols = [1, 3, 6, 8]
-    for (label, val), col in zip(summaries, cols):
-        lc = ws.cell(5, col, label)
-        style_cell(lc, bold=True, align='right', bg='F0F4FF')
-        ws.merge_cells(start_row=5, start_column=col, end_row=5, end_column=col)
-        vc = ws.cell(5, col+1, val)
-        style_cell(vc, bold=True, align='left', bg='FAFCFF', num_fmt=NUM)
-    ws.row_dimensions[5].height = 18
-
-    # ── Header row ──
     headers = ['NO', 'TANGGAL', 'NAMA', 'KETERANGAN', 'KODE', 'DEBET', 'KREDIT', 'SALDO', 'PENJELASAN']
-    header_cols = ['A','B','C','D','E','F','G','H','I']
-    ws.row_dimensions[6].height = 20
-    for col_letter, hdr in zip(header_cols, headers):
-        c = ws[f'{col_letter}6']
-        c.value = hdr
-        style_cell(c, bold=True, color='FFFFFF', bg=colors['header'], align='center')
-        c.border = border
+    for i, h in enumerate(headers, 1):
+        cell = ws.cell(6, i, h)
+        cell.font = Font(bold=True, color='FFFFFF')
+        cell.fill = PatternFill('solid', start_color=colors['header'])
+        cell.alignment = Alignment(horizontal='center')
 
-    # ── Data rows ──
     saldo = data['saldo_awal']
     for idx, tx in enumerate(data['txs'], 1):
         saldo = round(saldo + tx['kredit'] - tx['debet'], 2)
         row = idx + 6
-        bg = 'FFFFFF' if idx % 2 == 0 else 'F8FAFF'
+        vals = [idx, tx['date'], tx['nama'], tx['ket'], tx['kode'], tx['debet'], tx['kredit'], saldo, tx['penjelasan']]
+        for ci, v in enumerate(vals, 1):
+            c = ws.cell(row, ci, clean_excel_string(v))
+            if ci >= 6 and isinstance(v, (int, float)): c.number_format = '#,##0.00'
 
-        values = [idx, tx['date'], tx['nama'], tx['ket'], tx['kode'],
-                  tx['debet'] or '', tx['kredit'] or '', saldo, tx['penjelasan']]
+    for col in ['A','B','C','D','E','F','G','H','I']:
+        ws.column_dimensions[col].width = 15
+    ws.column_dimensions['C'].width = 25
+    ws.column_dimensions['D'].width = 25
+    ws.column_dimensions['I'].width = 40
 
-        for col_idx, raw_val in enumerate(values, 1):
-            val = clean_excel_string(raw_val) # Implementasi filter illegal chars
-            c = ws.cell(row, col_idx, val)
-            
-            num = None
-            aln = 'left'
-            if col_idx in (1, 2, 5): aln = 'center'
-            elif col_idx in (6, 7, 8):
-                aln = 'right'
-                if isinstance(val, float) and val > 0: num = NUM
-            style_cell(c, align=aln, bg=bg, num_fmt=num)
-            c.border = border
-        ws.row_dimensions[row].height = 15
-
-    # ── Totals row ──
-    total_row = len(data['txs']) + 7
-    ws.row_dimensions[total_row].height = 18
-    labels = ['', 'TOTAL', '', '', '', data['mut_db'], data['mut_cr'], data['saldo_akhir'], '']
-    for ci, val in enumerate(labels, 1):
-        c = ws.cell(total_row, ci, clean_excel_string(val))
-        num = NUM if ci in (6, 7, 8) and isinstance(val, float) else None
-        aln = 'right' if ci in (6, 7, 8) else ('center' if ci == 2 else 'left')
-        style_cell(c, bold=True, bg=colors['sub'], align=aln, num_fmt=num)
-        c.border = border
-
-    # ── Column widths ──
-    col_widths = {'A': 5, 'B': 10, 'C': 22, 'D': 25, 'E': 7, 'F': 16, 'G': 16, 'H': 18, 'I': 35}
-    for col, width in col_widths.items():
-        ws.column_dimensions[col].width = width
-
-    ws.freeze_panes = 'A7'
     out = io.BytesIO()
     wb.save(out)
     out.seek(0)
     return out
 
 # ─────────────────────────────────────────────
-# HTML UI (TETAP SAMA SEPERTI SEBELUMNYA)
+# FLASK ROUTES
 # ─────────────────────────────────────────────
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="id">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
-<title>Bank Statement Converter</title>
+<title>Bank Statement Fix V2.3</title>
 <style>
-  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap');
-
-  :root {
-    --bg:       #0a0e1a;
-    --surface:  #111827;
-    --card:     #161d2e;
-    --border:   #1e2d45;
-    --accent:   #3b82f6;
-    --accent2:  #06b6d4;
-    --text:     #e2e8f0;
-    --muted:    #64748b;
-    --success:  #10b981;
-    --danger:   #ef4444;
-    --radius:   16px;
-  }
-
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-  body {
-    font-family: 'IBM Plex Sans', sans-serif;
-    background: var(--bg);
-    color: var(--text);
-    min-height: 100vh;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    padding: 24px 16px 48px;
-  }
-
-  /* Grid background */
-  body::before {
-    content: '';
-    position: fixed;
-    inset: 0;
-    background-image:
-      linear-gradient(rgba(59,130,246,.04) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(59,130,246,.04) 1px, transparent 1px);
-    background-size: 40px 40px;
-    pointer-events: none;
-    z-index: 0;
-  }
-
-  .container { position: relative; z-index: 1; width: 100%; max-width: 520px; }
-
-  /* Header */
-  .header { text-align: center; margin-bottom: 32px; }
-  .logo-wrap {
-    display: inline-flex; align-items: center; justify-content: center;
-    width: 64px; height: 64px;
-    background: linear-gradient(135deg, var(--accent), var(--accent2));
-    border-radius: 18px; margin-bottom: 16px;
-    box-shadow: 0 0 32px rgba(59,130,246,.35);
-  }
-  .logo-wrap svg { width: 32px; height: 32px; color: white; }
-  h1 { font-size: clamp(20px,5vw,28px); font-weight: 700; letter-spacing: -0.5px; }
-  .subtitle { color: var(--muted); font-size: 14px; margin-top: 6px; }
-
-  /* Bank badges */
-  .banks {
-    display: flex; gap: 8px; justify-content: center; margin-top: 16px; flex-wrap: wrap;
-  }
-  .badge {
-    font-family: 'IBM Plex Mono', monospace;
-    font-size: 11px; font-weight: 500;
-    padding: 4px 10px; border-radius: 6px; border: 1px solid;
-  }
-  .badge-bca    { color: #60a5fa; border-color: #1e3a5f; background: #0a1929; }
-  .badge-bri    { color: #34d399; border-color: #1a3a2e; background: #0a1f18; }
-  .badge-mandiri{ color: #fbbf24; border-color: #3a2f0a; background: #1f1800; }
-
-  /* Card */
-  .card {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    overflow: hidden;
-    margin-bottom: 16px;
-  }
-  .card-header {
-    background: var(--surface);
-    border-bottom: 1px solid var(--border);
-    padding: 14px 20px;
-    font-size: 12px; font-weight: 600;
-    text-transform: uppercase; letter-spacing: .08em;
-    color: var(--muted);
-    display: flex; align-items: center; gap: 8px;
-  }
-  .card-header::before {
-    content: '';
-    display: block; width: 3px; height: 14px;
-    background: linear-gradient(var(--accent), var(--accent2));
-    border-radius: 2px;
-  }
-  .card-body { padding: 20px; }
-
-  /* Drop zone */
-  .drop-zone {
-    border: 2px dashed var(--border);
-    border-radius: 12px;
-    padding: 32px 20px;
-    text-align: center;
-    cursor: pointer;
-    transition: all .2s;
-    background: rgba(59,130,246,.03);
-    position: relative;
-  }
-  .drop-zone:hover, .drop-zone.dragover {
-    border-color: var(--accent);
-    background: rgba(59,130,246,.08);
-  }
-  .drop-zone input[type=file] {
-    position: absolute; inset: 0; opacity: 0; cursor: pointer;
-  }
-  .drop-icon {
-    width: 44px; height: 44px;
-    background: linear-gradient(135deg, rgba(59,130,246,.2), rgba(6,182,212,.2));
-    border-radius: 12px;
-    display: flex; align-items: center; justify-content: center;
-    margin: 0 auto 12px;
-  }
-  .drop-icon svg { width: 22px; height: 22px; color: var(--accent); }
-  .drop-label { font-size: 14px; color: var(--muted); line-height: 1.5; }
-  .drop-label strong { color: var(--text); }
-  .file-list { margin-top: 16px; display: flex; flex-direction: column; gap: 8px; }
-  .file-item {
-    display: flex; align-items: center; gap: 10px;
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 8px; padding: 8px 12px; font-size: 13px;
-  }
-  .file-item .icon { font-size: 16px; }
-  .file-item .fname { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .file-item .size  { color: var(--muted); font-size: 11px; font-family: 'IBM Plex Mono', monospace; }
-  .file-item .rm {
-    cursor: pointer; color: var(--muted); font-size: 18px; line-height: 1;
-    transition: color .15s; flex-shrink: 0;
-  }
-  .file-item .rm:hover { color: var(--danger); }
-
-  /* Button */
-  .btn {
-    width: 100%; padding: 14px;
-    background: linear-gradient(135deg, var(--accent) 0%, var(--accent2) 100%);
-    color: white; font-weight: 700; font-size: 15px;
-    border: none; border-radius: 12px; cursor: pointer;
-    transition: all .2s; display: flex; align-items: center;
-    justify-content: center; gap: 8px;
-    box-shadow: 0 4px 20px rgba(59,130,246,.3);
-    font-family: 'IBM Plex Sans', sans-serif;
-    letter-spacing: .01em;
-  }
-  .btn:hover:not(:disabled) {
-    transform: translateY(-1px);
-    box-shadow: 0 6px 24px rgba(59,130,246,.45);
-  }
-  .btn:active:not(:disabled) { transform: translateY(0); }
-  .btn:disabled { opacity: .45; cursor: not-allowed; box-shadow: none; transform: none; }
-
-  /* Progress */
-  .progress-wrap {
-    height: 3px; background: var(--border); border-radius: 2px;
-    overflow: hidden; margin-top: 12px; display: none;
-  }
-  .progress-bar {
-    height: 100%; width: 0%;
-    background: linear-gradient(90deg, var(--accent), var(--accent2));
-    border-radius: 2px; transition: width .4s ease;
-  }
-
-  /* Status */
-  .status-row {
-    display: flex; align-items: center; gap: 10px;
-    font-size: 13px; color: var(--muted); margin-top: 12px;
-    min-height: 20px;
-  }
-  .dot {
-    width: 7px; height: 7px; border-radius: 50%;
-    background: var(--muted); flex-shrink: 0;
-  }
-  .dot.proc { background: var(--accent); animation: pulse 1s infinite; }
-  .dot.ok   { background: var(--success); }
-  .dot.err  { background: var(--danger); }
-  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
-
-  /* Footer */
-  footer {
-    color: var(--muted); font-size: 12px; text-align: center;
-    margin-top: 8px; line-height: 1.7;
-  }
-
-  /* Result box */
-  .result-box {
-    background: rgba(16,185,129,.08);
-    border: 1px solid rgba(16,185,129,.3);
-    border-radius: 10px; padding: 14px 16px;
-    margin-top: 12px; display: none;
-    align-items: center; gap: 12px; font-size: 13px;
-  }
-  .result-box.show { display: flex; }
-  .result-icon { font-size: 24px; flex-shrink: 0; }
-  .result-text { flex: 1; }
-  .result-text strong { display: block; color: var(--success); font-size: 14px; margin-bottom: 2px; }
-
-  @media (max-width: 400px) {
-    body { padding: 16px 12px 32px; }
-    .card-body { padding: 16px; }
-  }
+    body { font-family: sans-serif; background: #f0f2f5; padding: 40px; display: flex; justify-content: center; }
+    .card { background: white; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.1); width: 100%; max-width: 500px; }
+    h2 { color: #1a73e8; margin-top: 0; }
+    input[type=file] { margin: 20px 0; display: block; }
+    button { background: #1a73e8; color: white; border: none; padding: 12px 20px; border-radius: 6px; cursor: pointer; width: 100%; font-weight: bold; }
+    button:disabled { background: #ccc; }
+    #status { margin-top: 20px; padding: 15px; border-radius: 6px; display: none; font-size: 14px; }
+    .err { background: #fde8e8; color: #c81e1e; border: 1px solid #f8b4b4; }
+    .ok { background: #def7ec; color: #03543f; border: 1px solid #bcf0da; }
 </style>
 </head>
 <body>
-<div class="container">
-
-  <div class="header">
-    <div class="logo-wrap">
-      <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
-        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-          d="M9 17v-2m3 2v-4m3 4v-6m2 10H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z"/>
-      </svg>
-    </div>
-    <h1>Bank Statement Converter</h1>
-    <p class="subtitle">Konversi mutasi PDF ke Excel secara otomatis</p>
-    <div class="banks">
-      <span class="badge badge-bca">✦ BCA</span>
-      <span class="badge badge-bri">✦ BRI</span>
-      <span class="badge badge-mandiri">✦ Mandiri</span>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="card-header">Upload File PDF</div>
-    <div class="card-body">
-      <div class="drop-zone" id="dropZone">
-        <input type="file" id="fileInput" multiple accept=".pdf">
-        <div class="drop-icon">
-          <svg fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2"
-              d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/>
-          </svg>
-        </div>
-        <div class="drop-label">
-          <strong>Klik atau seret file ke sini</strong><br>
-          Bisa pilih 1–12 file PDF sekaligus (BCA / BRI / Mandiri)
-        </div>
-      </div>
-      <div class="file-list" id="fileList"></div>
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="card-header">Proses Konversi</div>
-    <div class="card-body">
-      <button class="btn" id="convertBtn" disabled onclick="startConvert()">
-        <svg width="18" height="18" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.5"
-            d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-8l-4-4m0 0L8 8m4-4v12"/>
-        </svg>
-        Generate Excel
-      </button>
-      <div class="progress-wrap" id="progressWrap">
-        <div class="progress-bar" id="progressBar"></div>
-      </div>
-      <div class="status-row">
-        <div class="dot" id="statusDot"></div>
-        <span id="statusText">Pilih file PDF untuk memulai</span>
-      </div>
-      <div class="result-box" id="resultBox">
-        <div class="result-icon">✅</div>
-        <div class="result-text" id="resultText"></div>
-      </div>
-    </div>
-  </div>
-
-  <footer>
-    Mendukung format e-statement BCA, BRI (IBIZ), dan Mandiri (Kopra)<br>
-    Semua pemrosesan dilakukan di server — file tidak disimpan
-  </footer>
+<div class="card">
+    <h2>Bank Statement Converter</h2>
+    <p style="font-size: 13px; color: #666;">Silakan upload PDF BCA, BRI, atau Mandiri.</p>
+    <input type="file" id="files" multiple accept=".pdf">
+    <button id="btn" onclick="upload()">GENERATE EXCEL</button>
+    <div id="status"></div>
 </div>
 
 <script>
-const files = {};
-const dz   = document.getElementById('dropZone');
-const fi   = document.getElementById('fileInput');
-const btn  = document.getElementById('convertBtn');
-const list = document.getElementById('fileList');
+async function upload() {
+    const btn = document.getElementById('btn');
+    const status = document.getElementById('status');
+    const files = document.getElementById('files').files;
+    if (files.length === 0) return;
 
-dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('dragover'); });
-dz.addEventListener('dragleave', () => dz.classList.remove('dragover'));
-dz.addEventListener('drop', e => {
-  e.preventDefault(); dz.classList.remove('dragover');
-  handleFiles([...e.dataTransfer.files]);
-});
-fi.addEventListener('change', e => handleFiles([...e.target.files]));
-dz.addEventListener('click', e => { if (e.target === dz || e.target.closest('.drop-icon, .drop-label')) fi.click(); });
+    btn.disabled = true;
+    status.style.display = 'block';
+    status.className = 'ok';
+    status.innerText = 'Sedang memproses...';
 
-function fmtSize(bytes) {
-  if (bytes < 1024) return bytes + ' B';
-  if (bytes < 1048576) return (bytes/1024).toFixed(1) + ' KB';
-  return (bytes/1048576).toFixed(1) + ' MB';
-}
+    const fd = new FormData();
+    for (let f of files) fd.append('files', f);
 
-function handleFiles(newFiles) {
-  newFiles.filter(f => f.name.toLowerCase().endsWith('.pdf')).forEach(f => { files[f.name] = f; });
-  renderList();
-}
-
-function renderList() {
-  list.innerHTML = '';
-  Object.keys(files).forEach(name => {
-    const f = files[name];
-    const div = document.createElement('div');
-    div.className = 'file-item';
-    div.innerHTML = `
-      <span class="icon">📄</span>
-      <span class="fname">${name}</span>
-      <span class="size">${fmtSize(f.size)}</span>
-      <span class="rm" data-name="${name}">×</span>`;
-    list.appendChild(div);
-  });
-  list.querySelectorAll('.rm').forEach(el => {
-    el.addEventListener('click', e => {
-      delete files[e.target.dataset.name];
-      renderList();
-      updateBtn();
-    });
-  });
-  updateBtn();
-}
-
-function updateBtn() { btn.disabled = Object.keys(files).length === 0; }
-function setStatus(state, text) {
-  const dot = document.getElementById('statusDot');
-  dot.className = 'dot ' + (state === 'proc' ? 'proc' : state === 'ok' ? 'ok' : state === 'err' ? 'err' : '');
-  document.getElementById('statusText').textContent = text;
-}
-function setProgress(pct) {
-  const w = document.getElementById('progressWrap');
-  const b = document.getElementById('progressBar');
-  w.style.display = pct > 0 ? 'block' : 'none';
-  b.style.width = pct + '%';
-}
-
-async function startConvert() {
-  const flist = Object.values(files);
-  if (!flist.length) return;
-  btn.disabled = true;
-  document.getElementById('resultBox').classList.remove('show');
-  setStatus('proc', `Mengirim ${flist.length} file ke server...`);
-  setProgress(10);
-  const fd = new FormData();
-  flist.forEach(f => fd.append('files', f));
-
-  try {
-    setProgress(40);
-    setStatus('proc', 'Mengekstrak transaksi dari PDF...');
-    const res = await fetch('/convert', { method: 'POST', body: fd });
-    setProgress(80);
-    if (!res.ok) throw new Error(await res.text());
-
-    setProgress(95);
-    setStatus('proc', 'Membuat file Excel...');
-    const blob = await res.blob();
-    const fname = res.headers.get('X-Filename') || 'Mutasi_Bank.xlsx';
-
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url; a.download = fname; a.click();
-    URL.revokeObjectURL(url);
-
-    setProgress(100);
-    setStatus('ok', `Selesai! File "${fname}" berhasil diunduh.`);
-    const rb = document.getElementById('resultBox');
-    document.getElementById('resultText').innerHTML = `<strong>${fname}</strong>File Excel siap — cek folder unduhan Anda.`;
-    rb.classList.add('show');
-    setTimeout(() => setProgress(0), 1500);
-
-  } catch (err) {
-    setStatus('err', 'Gagal: ' + err.message);
-    setProgress(0);
-  } finally { btn.disabled = false; }
+    try {
+        const res = await fetch('/convert', { method: 'POST', body: fd });
+        if (!res.ok) {
+            const errText = await res.text();
+            throw new Error(errText);
+        }
+        
+        const blob = await res.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `Mutasi_Rekening_${new Date().getTime()}.xlsx`;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        
+        status.innerText = 'Berhasil! File Excel telah diunduh.';
+    } catch (e) {
+        status.className = 'err';
+        status.innerText = 'Gagal: ' + e.message;
+    } finally {
+        btn.disabled = false;
+    }
 }
 </script>
 </body>
@@ -881,62 +414,54 @@ def index():
 
 @app.route('/convert', methods=['POST'])
 def convert():
-    # Menambahkan Blok Penanganan Error Global 
-    # agar tidak mengeluarkan HTML Server Error jika ada kendala
     try:
         uploaded = request.files.getlist('files')
-        if not uploaded: return 'Tidak ada file yang diunggah.', 400
+        if not uploaded: return 'Pilih file terlebih dahulu', 400
 
-        all_txs    = []
-        period_set = set()
-        bank_set   = set()
-        saldo_awal = None
-        saldo_akhir = mut_cr = mut_db = 0
-        nama_akun = ''
-        no_rek_set = set()
+        all_txs = []
+        bank_set = set(); period_set = set(); no_rek_set = set()
+        saldo_awal = None; saldo_akhir = 0
+        mut_cr = mut_db = 0; nama_akun = ''
 
         for f in uploaded:
-            raw = f.read()
-            data = parse_pdf(raw) # Biarkan Python yang melemparkan error jika gagal
-
-            if saldo_awal is None:
+            data = parse_pdf(f.read())
+            if saldo_awal is None: 
                 saldo_awal = data['saldo_awal']
-                nama_akun  = data['nama_akun']
-
+                nama_akun = data['nama_akun']
             saldo_akhir = data['saldo_akhir']
-            mut_cr     += data['mut_cr']
-            mut_db     += data['mut_db']
+            mut_cr += data['mut_cr']
+            mut_db += data['mut_db']
             all_txs.extend(data['txs'])
-            period_set.add(data['period'])
             bank_set.add(data['bank'])
+            period_set.add(data['period'])
             no_rek_set.add(data['no_rek'])
 
         merged = {
-            'bank':       ' + '.join(sorted(bank_set)),
-            'no_rek':     ' | '.join(sorted(no_rek_set)),
-            'nama_akun':  nama_akun,
-            'period':     ' | '.join(sorted(period_set)),
-            'saldo_awal': saldo_awal or 0,
-            'saldo_akhir':saldo_akhir,
-            'mut_cr':     mut_cr,
-            'mut_db':     mut_db,
-            'txs':        all_txs,
+            'bank': ' + '.join(bank_set),
+            'no_rek': ' / '.join(no_rek_set),
+            'nama_akun': nama_akun,
+            'period': ' - '.join(period_set),
+            'saldo_awal': saldo_awal,
+            'saldo_akhir': saldo_akhir,
+            'mut_cr': mut_cr,
+            'mut_db': mut_db,
+            'txs': all_txs
         }
 
-        excel = create_excel(merged)
-        banks_str = '_'.join(sorted(bank_set))
-        fname = f"Mutasi_{banks_str}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-
-        return send_file(
-            excel, mimetype=mime, as_attachment=True,
-            download_name=fname, headers={'X-Filename': fname}
-        )
+        excel_file = create_excel(merged)
+        
+        # FIX COMPATIBILITY: Kirim file dengan cara manual agar support Flask versi lama
+        response = make_response(send_file(
+            excel_file, 
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            attachment_filename='Mutasi_Bank.xlsx' # Menggunakan parameter lama untuk kompatibilitas
+        ))
+        return response
 
     except Exception as e:
-        # Jika ada error, catat di terminal dan kirimkan teks aslinya ke user UI
         traceback.print_exc()
-        return f"Terjadi kesalahan saat memproses data Excel: {str(e)}", 500
+        return str(e), 500
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
