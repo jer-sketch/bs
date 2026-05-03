@@ -1,17 +1,18 @@
 """
 Bank Statement PDF → Excel Converter
 Mendukung: BCA, BRI, Mandiri
-Versi: 2.1 (Optimasi Kolom Nama & Penjelasan)
+Versi: 2.2 (Fix 500 Error & Illegal Characters)
 """
 
 import re
 import io
+import traceback
 from datetime import datetime
 
 import pdfplumber
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-from openpyxl.utils import get_column_letter
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
 from flask import Flask, request, send_file, render_template_string
 
 app = Flask(__name__)
@@ -130,7 +131,6 @@ def parse_bca(all_lines: list[str]) -> dict:
     saldo_awal = saldo_akhir = mut_cr = mut_db = 0
     no_rek = ''
 
-    # Clean lines and extract headers
     cleaned_lines = []
     for l in all_lines:
         l_up = l.upper()
@@ -152,7 +152,6 @@ def parse_bca(all_lines: list[str]) -> dict:
 
     year = period.split()[-1] if period else str(datetime.now().year)
 
-    # Group into transaction blocks
     DATE_RE = re.compile(r'^(\d{2})/(\d{2})\s+')
     tx_blocks = []
     current_block = []
@@ -240,7 +239,6 @@ def parse_bri(all_lines: list[str]) -> dict:
         is_credit = cr > 0
         ket, kode = classify(desc, is_credit)
         
-        # BRI description goes to 'penjelasan' directly
         txs.append({
             'date': date_raw, 'nama': '', 'ket': ket, 'kode': kode,
             'debet': db, 'kredit': cr, 'penjelasan': desc.strip()
@@ -355,7 +353,7 @@ def parse_pdf(pdf_bytes: bytes) -> dict:
     else: raise ValueError("Format bank tidak dikenali. Pastikan PDF adalah mutasi BCA, BRI, atau Mandiri.")
 
 # ─────────────────────────────────────────────
-# GENERATOR EXCEL (9 KOLOM: NAMA & PENJELASAN)
+# GENERATOR EXCEL & FILTER KARAKTER ILEGAL
 # ─────────────────────────────────────────────
 
 BANK_COLORS = {
@@ -364,10 +362,18 @@ BANK_COLORS = {
     'MANDIRI': {'header': '003087', 'sub': 'E5ECF6', 'accent': 'F5A623'},
 }
 
+def clean_excel_string(val):
+    """Membersihkan karakter tersembunyi yang ditolak oleh OpenPyXL"""
+    if isinstance(val, str):
+        return ILLEGAL_CHARACTERS_RE.sub('', val)
+    return val
+
 def create_excel(data: dict) -> io.BytesIO:
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = f"Mutasi {data['bank']}"
+    # Pastikan title worksheet tidak lebih dari 31 karakter
+    safe_title = f"Mutasi {data['bank']}"
+    ws.title = safe_title[:31] 
 
     bank   = data['bank']
     colors = BANK_COLORS.get(bank, BANK_COLORS['BCA'])
@@ -390,12 +396,12 @@ def create_excel(data: dict) -> io.BytesIO:
     ws.row_dimensions[1].height = 26
 
     ws.merge_cells('A2:I2')
-    ws['A2'] = data['nama_akun']
+    ws['A2'] = clean_excel_string(data['nama_akun'])
     style_cell(ws['A2'], bold=True, align='center', bg=colors['sub'])
     ws.row_dimensions[2].height = 18
 
     ws.merge_cells('A3:I3')
-    ws['A3'] = f"No. Rekening: {data['no_rek']}    |    Periode: {data['period']}"
+    ws['A3'] = clean_excel_string(f"No. Rekening: {data['no_rek']}    |    Periode: {data['period']}")
     style_cell(ws['A3'], align='center', bg=colors['sub'])
     ws.row_dimensions[3].height = 16
 
@@ -410,7 +416,7 @@ def create_excel(data: dict) -> io.BytesIO:
         ('Total Debet', data['mut_db']),
         ('Saldo Akhir', data['saldo_akhir']),
     ]
-    cols = [1, 3, 6, 8]  # Adjusted spanning for 9 columns
+    cols = [1, 3, 6, 8]
     for (label, val), col in zip(summaries, cols):
         lc = ws.cell(5, col, label)
         style_cell(lc, bold=True, align='right', bg='F0F4FF')
@@ -419,7 +425,7 @@ def create_excel(data: dict) -> io.BytesIO:
         style_cell(vc, bold=True, align='left', bg='FAFCFF', num_fmt=NUM)
     ws.row_dimensions[5].height = 18
 
-    # ── Header row (9 KOLOM BARU) ──
+    # ── Header row ──
     headers = ['NO', 'TANGGAL', 'NAMA', 'KETERANGAN', 'KODE', 'DEBET', 'KREDIT', 'SALDO', 'PENJELASAN']
     header_cols = ['A','B','C','D','E','F','G','H','I']
     ws.row_dimensions[6].height = 20
@@ -439,8 +445,10 @@ def create_excel(data: dict) -> io.BytesIO:
         values = [idx, tx['date'], tx['nama'], tx['ket'], tx['kode'],
                   tx['debet'] or '', tx['kredit'] or '', saldo, tx['penjelasan']]
 
-        for col_idx, val in enumerate(values, 1):
+        for col_idx, raw_val in enumerate(values, 1):
+            val = clean_excel_string(raw_val) # Implementasi filter illegal chars
             c = ws.cell(row, col_idx, val)
+            
             num = None
             aln = 'left'
             if col_idx in (1, 2, 5): aln = 'center'
@@ -456,7 +464,7 @@ def create_excel(data: dict) -> io.BytesIO:
     ws.row_dimensions[total_row].height = 18
     labels = ['', 'TOTAL', '', '', '', data['mut_db'], data['mut_cr'], data['saldo_akhir'], '']
     for ci, val in enumerate(labels, 1):
-        c = ws.cell(total_row, ci, val)
+        c = ws.cell(total_row, ci, clean_excel_string(val))
         num = NUM if ci in (6, 7, 8) and isinstance(val, float) else None
         aln = 'right' if ci in (6, 7, 8) else ('center' if ci == 2 else 'left')
         style_cell(c, bold=True, bg=colors['sub'], align=aln, num_fmt=num)
@@ -474,7 +482,7 @@ def create_excel(data: dict) -> io.BytesIO:
     return out
 
 # ─────────────────────────────────────────────
-# HTML UI (TETAP SAMA SEPERTI MILIK ANDA)
+# HTML UI (TETAP SAMA SEPERTI SEBELUMNYA)
 # ─────────────────────────────────────────────
 
 HTML_TEMPLATE = """<!DOCTYPE html>
@@ -873,55 +881,62 @@ def index():
 
 @app.route('/convert', methods=['POST'])
 def convert():
-    uploaded = request.files.getlist('files')
-    if not uploaded: return 'Tidak ada file yang diunggah.', 400
+    # Menambahkan Blok Penanganan Error Global 
+    # agar tidak mengeluarkan HTML Server Error jika ada kendala
+    try:
+        uploaded = request.files.getlist('files')
+        if not uploaded: return 'Tidak ada file yang diunggah.', 400
 
-    all_txs    = []
-    period_set = set()
-    bank_set   = set()
-    saldo_awal = None
-    saldo_akhir = mut_cr = mut_db = 0
-    nama_akun = ''
-    no_rek_set = set()
+        all_txs    = []
+        period_set = set()
+        bank_set   = set()
+        saldo_awal = None
+        saldo_akhir = mut_cr = mut_db = 0
+        nama_akun = ''
+        no_rek_set = set()
 
-    for f in uploaded:
-        raw = f.read()
-        try: data = parse_pdf(raw)
-        except Exception as e: return f'Error memproses {f.filename}: {str(e)}', 400
+        for f in uploaded:
+            raw = f.read()
+            data = parse_pdf(raw) # Biarkan Python yang melemparkan error jika gagal
 
-        if saldo_awal is None:
-            saldo_awal = data['saldo_awal']
-            nama_akun  = data['nama_akun']
+            if saldo_awal is None:
+                saldo_awal = data['saldo_awal']
+                nama_akun  = data['nama_akun']
 
-        saldo_akhir = data['saldo_akhir']
-        mut_cr     += data['mut_cr']
-        mut_db     += data['mut_db']
-        all_txs.extend(data['txs'])
-        period_set.add(data['period'])
-        bank_set.add(data['bank'])
-        no_rek_set.add(data['no_rek'])
+            saldo_akhir = data['saldo_akhir']
+            mut_cr     += data['mut_cr']
+            mut_db     += data['mut_db']
+            all_txs.extend(data['txs'])
+            period_set.add(data['period'])
+            bank_set.add(data['bank'])
+            no_rek_set.add(data['no_rek'])
 
-    merged = {
-        'bank':       ' + '.join(sorted(bank_set)),
-        'no_rek':     ' | '.join(sorted(no_rek_set)),
-        'nama_akun':  nama_akun,
-        'period':     ' | '.join(sorted(period_set)),
-        'saldo_awal': saldo_awal or 0,
-        'saldo_akhir':saldo_akhir,
-        'mut_cr':     mut_cr,
-        'mut_db':     mut_db,
-        'txs':        all_txs,
-    }
+        merged = {
+            'bank':       ' + '.join(sorted(bank_set)),
+            'no_rek':     ' | '.join(sorted(no_rek_set)),
+            'nama_akun':  nama_akun,
+            'period':     ' | '.join(sorted(period_set)),
+            'saldo_awal': saldo_awal or 0,
+            'saldo_akhir':saldo_akhir,
+            'mut_cr':     mut_cr,
+            'mut_db':     mut_db,
+            'txs':        all_txs,
+        }
 
-    excel = create_excel(merged)
-    banks_str = '_'.join(sorted(bank_set))
-    fname = f"Mutasi_{banks_str}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-    mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        excel = create_excel(merged)
+        banks_str = '_'.join(sorted(bank_set))
+        fname = f"Mutasi_{banks_str}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        mime = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
 
-    return send_file(
-        excel, mimetype=mime, as_attachment=True,
-        download_name=fname, headers={'X-Filename': fname}
-    )
+        return send_file(
+            excel, mimetype=mime, as_attachment=True,
+            download_name=fname, headers={'X-Filename': fname}
+        )
+
+    except Exception as e:
+        # Jika ada error, catat di terminal dan kirimkan teks aslinya ke user UI
+        traceback.print_exc()
+        return f"Terjadi kesalahan saat memproses data Excel: {str(e)}", 500
 
 if __name__ == '__main__':
     app.run(debug=True, port=5000)
